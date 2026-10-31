@@ -20193,7 +20193,7 @@ function estateIvy(g, rng, o) {
    AUDIO — fully synthesized (WebAudio): UI, hooves, crowd, bell
    ============================================================ */
 const Audio2 = {
-  ctx: null, master: null, on: true, crowdG: null, rumbleG: null, windG: null, lastHoof: 0, birdsT: 3,
+  ctx: null, master: null, on: true, crowdG: null, rumbleG: null, windG: null, rainG: null, gustG: null, windF: null, gust: null, lastHoof: 0, birdsT: 3,
   init() {
     if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
     try {
@@ -20203,7 +20203,15 @@ const Audio2 = {
       let b = 0; for (let i = 0; i < len; i++) { const w = Math.random() * 2 - 1; b = 0.97 * b + 0.03 * w; d[i] = w * 0.5 + b * 2; }
       this.noise = buf;
       const loop = (f, q, g) => { const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true; const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = q; const gn = ctx.createGain(); gn.gain.value = 0; s.connect(bp).connect(gn).connect(this.master); s.start(); return gn; };
-      this.crowdG = loop(900, 0.5, 0); this.rumbleG = loop(140, 0.8, 0); this.windG = loop(500, 0.3, 0);
+      this.crowdG = loop(900, 0.5, 0); this.rumbleG = loop(140, 0.8, 0); this.rainG = loop(2400, 0.45, 0);
+      // wind: deep brown noise under a low lowpass, with slow gusts. No hiss: phone speakers play everything above ~1 kHz as static.
+      const wl = ctx.sampleRate * 6, wf = ctx.sampleRate >> 1, x = new Float32Array(wl + wf); let br = 0, ss = 0;
+      for (let i = 0; i < x.length; i++) { br = 0.996 * br + 0.04 * (Math.random() * 2 - 1); x[i] = br; ss += br * br; }
+      const wn = 0.25 / Math.sqrt(ss / x.length), wb = ctx.createBuffer(1, wl, ctx.sampleRate), wd = wb.getChannelData(0);
+      for (let i = 0; i < wl; i++) wd[i] = (i < wf ? x[i] * (i / wf) + x[wl + i] * (1 - i / wf) : x[i]) * wn;   // the tail fades into the head, so the loop has no seam
+      const ws = ctx.createBufferSource(); ws.buffer = wb; ws.loop = true; this.windF = ctx.createBiquadFilter(); this.windF.type = 'lowpass'; this.windF.frequency.value = 340; this.windF.Q.value = 0.5;
+      this.gustG = ctx.createGain(); this.gustG.gain.value = 0.7; this.windG = ctx.createGain(); this.windG.gain.value = 0;
+      const whp = ctx.createBiquadFilter(); whp.type = 'highpass'; whp.frequency.value = 85; whp.Q.value = 0.6; ws.connect(whp).connect(this.windF).connect(this.gustG).connect(this.windG).connect(this.master); ws.start(); this.gust = { v: 0.5, to: 0.5, t: 0, u: 0 };
     } catch (e) { this.ctx = null; }
   },
   setOn(v) { this.on = v; if (this.master) this.master.gain.setTargetAtTime(v ? 0.7 : 0, this.ctx.currentTime, 0.1); },
@@ -20238,11 +20246,18 @@ const Audio2 = {
   ambient(kind, dt) {
     if (!this.ctx) return; const ct = this.ctx.currentTime;
     const tgt = (g, v) => g && g.gain.setTargetAtTime(this.on ? v : 0, ct, 0.4);
+    this.gusts(dt);
     if (kind === 'ranch') {
-      tgt(this.windG, 0.05); tgt(this.crowdG, 0); tgt(this.rumbleG, 0);
+      tgt(this.windG, 0.045); tgt(this.rainG, 0); tgt(this.crowdG, 0); tgt(this.rumbleG, 0);
       this.birdsT -= dt; if (this.birdsT < 0 && this.on) { this.birdsT = 2 + Math.random() * 5; const t = ct; const f = 2400 + Math.random() * 1600; for (let i = 0; i < 2 + Math.floor(Math.random() * 4); i++) { const o = this.ctx.createOscillator(); o.frequency.setValueAtTime(f, t + i * 0.11); o.frequency.exponentialRampToValueAtTime(f * 1.5, t + i * 0.11 + 0.06); this._env(o, 0.005, 0.025, 0.07, t + i * 0.11); o.start(t + i * 0.11); o.stop(t + i * 0.11 + 0.1); } }
-    } else if (kind === 'studio') { tgt(this.windG, 0.0); tgt(this.crowdG, 0); tgt(this.rumbleG, 0); }
-    else if (kind === 'off') { tgt(this.windG, 0); tgt(this.crowdG, 0); tgt(this.rumbleG, 0); }
+    } else if (kind === 'studio') { tgt(this.windG, 0.0); tgt(this.rainG, 0); tgt(this.crowdG, 0); tgt(this.rumbleG, 0); }
+    else if (kind === 'off') { tgt(this.windG, 0); tgt(this.rainG, 0); tgt(this.crowdG, 0); tgt(this.rumbleG, 0); }
+  },
+  gusts(dt) {   // the wind rises and falls: a new gust every few seconds, eased in and out
+    const G = this.gust; if (!G || !this.gustG) return; G.t -= dt; G.u -= dt;
+    if (G.t <= 0) { G.to = Math.random() < 0.3 ? 0.85 + Math.random() * 0.15 : 0.15 + Math.random() * 0.5; G.t = 3 + Math.random() * 5; }
+    G.v += (G.to - G.v) * Math.min(1, dt * 0.45);
+    if (G.u <= 0) { G.u = 0.25; const ct = this.ctx.currentTime; this.gustG.gain.setTargetAtTime(0.35 + 0.65 * G.v, ct, 0.6); this.windF.frequency.setTargetAtTime(200 + 320 * G.v, ct, 0.6); }
   },
   race(rv) {
     if (!this.ctx) return; const ct = this.ctx.currentTime;
@@ -20250,7 +20265,7 @@ const Audio2 = {
     this.crowdG.gain.setTargetAtTime(this.on ? 0.03 + ex * 0.07 : 0, ct, 0.3);
     const lead = rv.runners.reduce((a, b) => Math.max(a, b.v), 0);
     this.rumbleG.gain.setTargetAtTime(this.on ? clamp(lead / 18, 0, 1) * 0.12 : 0, ct, 0.2);
-    this.windG.gain.setTargetAtTime(this.on && rv.race.weather === 'rain' ? 0.1 : 0.02, ct, 0.4);
+    this.windG.gain.setTargetAtTime(this.on ? 0.035 : 0, ct, 0.4); this.rainG.gain.setTargetAtTime(this.on && rv.race.weather === 'rain' ? 0.045 : 0, ct, 0.4); this.gusts(1 / 60);
     if (p && p.v > 2) { const ph = p.rig.phase; const beat = Math.floor(ph * 4); if (beat !== this.lastHoof) { this.lastHoof = beat; this.hoof(0.08 + clamp(p.v / 20, 0, 1) * 0.12); } }
   },
 };
@@ -27136,8 +27151,9 @@ Music.moodNow = function () { return Freestyle.active ? 'stretch' : _moodF(); };
    running before the big update, pointing at where each new
    system lives
    ============================================================ */
-const WHATS_NEW_V = 'w3';
+const WHATS_NEW_V = 'w4';
 const WHATS_NEW = [
+  ['🤝', 'Stable staff', 'Hire a groom, trainer, vet and head lad. Every morning they feed, groom, treat and train your animals for a daily wage. On the Stable screen.', 'staff'],
   ['🏆', 'Career seasons', 'Four rival stables, a points ladder and the Grand Mythic Derby. See the Races screen.', 'races'],
   ['🎀', 'Beauty shows', 'A class judged every day, including Freestyle to Music. On the Races screen.', 'races'],
   ['🧬', 'Breeding commissions', 'Clients want combinations you have to breed. In the Breeding Barn, with the odds for your pairing.', 'breed'],
@@ -27468,6 +27484,318 @@ UI.act = function (k, el, ev) {
   if (k === 'scApply') { SaveCode.apply(); return; }
   return _uiActSC.call(this, k, el, ev);
 };
+
+/* ============================================================
+   STAFF — hire a groom, a trainer, a vet and a head lad. Each
+   morning, when the new day starts, they look after the stable:
+   the vet treats the poorly, the groom feeds and grooms, the head
+   lad spends time with every animal, and the trainer works each one
+   through its training plan. Wages come out of the purse daily;
+   staff who aren't paid stop working, and leave after three days.
+   Better staff unlock as the stable levels up and cover more
+   animals. Hired staff walk the estate in their own colours.
+   ============================================================ */
+const STAFF_ROLES = {
+  groom: { name: 'Groom', ico: '🧹', job: 'Feeds, mucks out and grooms every morning. Uses hay from your feed room and buys more when it runs out.', wage: [60, 140, 320], perk: ['', 'a little extra shine (+4 mood)', 'show-ring turnout (+8 mood)'] },
+  trainer: { name: 'Trainer', ico: '⏱️', job: 'Works each animal through its training plan, and stops before it gets too tired to race.', wage: [120, 280, 650], perk: ['1 session each', '2 sessions each', '3 sessions each, no mood lost'] },
+  vet: { name: 'Vet', ico: '🩺', job: 'Checks every animal over and treats any that are off colour.', wage: [80, 200, 450], perk: ['+12 health', '+22 health', '+35 health'] },
+  lad: { name: 'Head lad', ico: '🤝', job: 'Spends time with every animal to keep spirits and bonds up.', wage: [40, 100, 240], perk: ['', '+3 mood, +1 bond', '+6 mood, +2 bond'] },
+};
+const STAFF_ORDER = ['vet', 'groom', 'lad', 'trainer'];   // the morning's running order: health first, training last (mood sets how much a session gains)
+const STAFF_SHOW = ['groom', 'trainer', 'vet', 'lad'];
+const STAFF_TIERS = [{ name: 'Apprentice', cap: 6, lvl: 1 }, { name: 'Experienced', cap: 16, lvl: 4 }, { name: 'Master', cap: 999, lvl: 8 }];
+const STAFF_FIRST = ['Ada', 'Bram', 'Cora', 'Dell', 'Effie', 'Finn', 'Greer', 'Hal', 'Ivy', 'Jory', 'Kit', 'Lark', 'Mabel', 'Ned', 'Odile', 'Pip', 'Rowan', 'Sadie', 'Tam', 'Una', 'Wes', 'Yara', 'Abel', 'Bess', 'Cal', 'Dora', 'Ezra', 'Flora', 'Gus', 'Hattie'];
+const STAFF_LAST = ['Ashby', 'Barrow', 'Calloway', 'Dunmore', 'Ellery', 'Fairweather', 'Garnett', 'Hollis', 'Ingram', 'Kettle', 'Lowry', 'Marsh', 'Nettle', 'Oakes', 'Pruitt', 'Quill', 'Rook', 'Sallow', 'Thorne', 'Vane', 'Whitlock', 'Yardley'];
+const STAFF_BLURB = [['Keen and learning fast', 'Fresh from the county riding school', 'Grew up mucking out the family pony'], ['Ten seasons on the circuit', 'Ran the yard at a busy livery', 'Knows every trick of the trade'], ['Kept a Derby winner sound', 'Head of a famous yard for years', 'The best in the county, and knows it']];
+const STAFF_SKIN = [[0.86, 0.66, 0.52], [0.62, 0.45, 0.33], [0.45, 0.3, 0.2], [0.93, 0.76, 0.64], [0.72, 0.52, 0.38]];
+const STAFF_HAIR = [[0.3, 0.18, 0.09], [0.12, 0.08, 0.05], [0.55, 0.38, 0.2], [0.68, 0.62, 0.55], [0.42, 0.16, 0.08]];
+const STAFF_OUTFIT = {   // working colours on the estate, so you can tell who is who
+  groom: { shirt: [0.36, 0.44, 0.3], jeans: [0.27, 0.24, 0.2], hat: [0.42, 0.31, 0.19], scarf: [0.82, 0.7, 0.36] },
+  trainer: { shirt: [0.84, 0.82, 0.76], jeans: [0.15, 0.16, 0.19], hat: [0.13, 0.11, 0.1], scarf: [0.55, 0.13, 0.13] },
+  vet: { shirt: [0.5, 0.64, 0.74], jeans: [0.3, 0.38, 0.48], hat: [0.76, 0.73, 0.66], scarf: [0.9, 0.9, 0.92] },
+  lad: { shirt: [0.48, 0.36, 0.24], jeans: [0.32, 0.29, 0.25], hat: [0.27, 0.23, 0.19], scarf: [0.2, 0.32, 0.26] },
+};
+const STAFF_ROUTE = { groom: [0, 2], lad: [0, 4], vet: [1, 2], trainer: [1, 5] };   // which stable hand's round they walk, and where on it they start
+const Staff = {
+  _quiet: false,
+  st() { const s = Game.s; if (!s.staff || typeof s.staff !== 'object') s.staff = {}; const t = s.staff; if (!t.hired) t.hired = {}; if (!t.plans) t.plans = {}; if (!t.done) t.done = {}; return t; },
+  hired(r) { return this.st().hired[r] || null; },
+  count() { return Object.keys(this.st().hired).length; },
+  wage(r, tier) { return STAFF_ROLES[r].wage[tier]; },
+  wages() { const h = this.st().hired; return Object.keys(h).reduce((a, r) => a + this.wage(r, h[r].tier), 0); },
+  cap(p) { return STAFF_TIERS[p.tier].cap; },
+  unlocked(tier) { return Game.s.level >= STAFF_TIERS[tier].lvl || !!(Game.s.cheats && Game.s.cheats.infMoney); },
+  cand(r, tier) {   // the candidate for a post this week
+    const rng = RNG(hashStr((Game.s.stableName || 'x') + '|' + r + '|' + tier + '|' + Math.floor(Game.s.day / 7)));
+    return { name: rng.pick(STAFF_FIRST) + ' ' + rng.pick(STAFF_LAST), blurb: rng.pick(STAFF_BLURB[tier]), skin: rng.int(0, STAFF_SKIN.length - 1), hair: rng.int(0, STAFF_HAIR.length - 1) };
+  },
+  plan(h) { const p = this.st().plans[h.id]; return p && (p === 'rest' || TRAININGS[p]) ? p : 'auto'; },
+  room(h, k) { const tr = TRAININGS[k]; let sc = 0; for (const [s, w] of Object.entries(tr.stats)) sc += w * Math.max(0, h.genome.q[s] - h.st[s]); return sc; },
+  roomAll(h) { let r = 0; for (const k of STAT_KEYS) r += Math.max(0, h.genome.q[k] - h.st[k]); return r; },
+  drill(h) {   // the session to run next: the animal's plan, or the drill with the most room to grow
+    const p = this.plan(h); if (p === 'rest') return null;
+    if (p !== 'auto') return this.room(h, p) >= 0.5 ? p : null;
+    if (h.care.mood < 35 && this.room(h, 'calm') >= 0.5) return 'calm';
+    let best = null, bs = 0.5; for (const k of Object.keys(TRAININGS)) { const sc = this.room(h, k); if (sc > bs) { bs = sc; best = k; } }
+    return best;
+  },
+  // ---- the morning round ----
+  work(only, force) {
+    const st = this.st(), s = Game.s, day = s.day;
+    const roles = (only ? [only] : STAFF_ORDER).filter(r => st.hired[r] && (force || st.done[r] !== day)); if (!roles.length) return null;
+    const rep = st.last && st.last.day === day ? st.last : { day, lines: {}, wages: 0, feed: 0, c: {} }; if (!rep.lines) rep.lines = {}; if (!rep.c) rep.c = {};
+    const add = (k, n) => { rep.c[k] = (rep.c[k] || 0) + n; };
+    const save = Game.save; this._quiet = true; Game.save = function () { };
+    try {
+      for (const r of roles) {
+        const p = st.hired[r]; st.done[r] = day;
+        if (!force) {
+          const w = this.wage(r, p.tier);
+          if (!Game.spend(w)) { p.unpaid = (p.unpaid || 0) + 1;
+            if (p.unpaid >= 3) { delete st.hired[r]; rep.lines[r] = p.name + ' left after three days without pay.'; Game.news(p.name + ' (' + STAFF_ROLES[r].name.toLowerCase() + ') left the stable after three days without pay.'); }
+            else rep.lines[r] = 'Wasn\'t paid, so did no work (' + p.unpaid + ' of 3 days).';
+            add('unpaid', 1);
+            continue; }
+          p.unpaid = 0; rep.wages += w;
+        }
+        try { rep.lines[r] = this.jobs[r].call(this, p, add); } catch (e) { console.error('staff', r, e); }
+      }
+    } finally { Game.save = save; this._quiet = false; }
+    st.last = rep; Game.save(); Game.emit('care'); this.syncRanch(); return rep;
+  },
+  queue(p, sorter, filter) { const all = Game.s.horses.filter(filter || (() => true)).sort(sorter); const cap = this.cap(p); return { list: all.slice(0, cap), left: Math.max(0, all.length - cap) }; },
+  more(n) { return n ? ` ${n} more need${n === 1 ? 's' : ''} a bigger team.` : ''; },
+  jobs: {
+    vet(p, add) {
+      const heal = [12, 22, 35][p.tier], q = this.queue(p, (a, b) => a.care.health - b.care.health); let n = 0;
+      for (const h of q.list) if (h.care.health < 95) { h.care.health = Math.min(100, h.care.health + heal); n++; }
+      add('treated', n);
+      return (n ? `Treated ${n}` : `Checked ${q.list.length}, all in good health`) + '.' + this.more(q.left);
+    },
+    groom(p, add) {
+      const s = Game.s, inf = !!(s.cheats && s.cheats.infMoney), hay = ITEMS.hay, need = h => Math.min(h.care.food, h.care.clean);
+      const q = this.queue(p, (a, b) => need(a) - need(b)); let fed = 0, gr = 0, used = 0, bought = 0, broke = false;
+      for (const h of q.list) {
+        let n = 0;
+        while (h.care.food < 70 && n < 3 && !broke) {
+          if (!inf) { if ((s.inv.hay || 0) > 0) { s.inv.hay--; used++; } else if (Game.spend(hay.price)) bought++; else { broke = true; break; } }
+          h.care.food = Math.min(100, h.care.food + hay.food); n++;
+        }
+        if (n) fed++;
+        if (Game.groom(h) === null) gr++;
+        if (p.tier) h.care.mood = Math.min(100, h.care.mood + 4 * p.tier);
+      }
+      add('feed', bought * hay.price); add('fed', fed); add('groomed', gr);
+      const parts = []; if (fed) parts.push(`fed ${fed}`); if (gr) parts.push(`groomed ${gr}`);
+      let t = parts.length ? parts.join(' and ') : 'everyone was already fed and groomed'; t = t[0].toUpperCase() + t.slice(1);
+      if (used || bought) t += ` (${used + bought} hay${bought ? ', ' + bought + ' bought for ' + fmtMoney(bought * hay.price) : ''})`;
+      return t + '.' + (broke ? ' Ran out of money for hay.' : '') + this.more(q.left);
+    },
+    lad(p, add) {
+      const q = this.queue(p, (a, b) => a.care.mood - b.care.mood); let n = 0;
+      for (const h of q.list) { if (Game.pet(h) === null) n++; if (p.tier) { h.care.mood = Math.min(100, h.care.mood + 3 * p.tier); h.bond = Math.min(100, h.bond + p.tier); } }
+      add('petted', n);
+      return (n ? `Spent time with ${n}` : 'Everyone had already had a fuss made of them') + '.' + this.more(q.left);
+    },
+    trainer(p, add) {
+      const ch = Game.s.cheats || {}, sessions = p.tier + 1, floor = [50, 45, 40][p.tier];
+      const q = this.queue(p, (a, b) => (b.fav ? 1 : 0) - (a.fav ? 1 : 0) || this.roomAll(b) - this.roomAll(a), h => this.plan(h) !== 'rest' && this.roomAll(h) >= 0.5);
+      let trained = 0, ses = 0, gain = 0, tired = 0;
+      for (const h of q.list) {
+        let n = 0;
+        for (let i = 0; i < sessions; i++) {
+          const k = this.drill(h); if (!k) break; const tr = TRAININGS[k];
+          if (!ch.noTire && h.care.energy - tr.energy < floor) { if (!n) tired++; break; }
+          const r = Game.train(h, k); if (!r || typeof r === 'string') break;
+          n++; for (const v of Object.values(r.gains)) gain += v;
+          if (p.tier === 2) h.care.mood = Math.min(100, h.care.mood + (tr.mood ? 0 : 4));
+        }
+        if (n) { trained++; ses += n; }
+      }
+      add('trained', trained); add('gain', gain);
+      let t = trained ? `Trained ${trained} (${ses} session${ses === 1 ? '' : 's'}, +${gain} stat${gain === 1 ? '' : 's'})` : 'No training today';
+      if (tired) t += `. ${tired} too tired to work`;
+      if (!q.list.length) t = 'Nothing to train: every animal is resting or at its potential';
+      return t + '.' + this.more(q.left);
+    },
+  },
+  brief(rep) {   // the morning toast: what got done, in a few words
+    const c = rep.c || {}, b = [];
+    if (c.fed || c.groomed) b.push(c.fed >= c.groomed ? `fed ${c.fed}` : `groomed ${c.groomed}`);
+    if (c.trained) b.push(`trained ${c.trained} (+${c.gain || 0})`);
+    if (c.treated) b.push(`treated ${c.treated}`);
+    if (c.petted && !b.length) b.push(`fussed over ${c.petted}`);
+    if (c.unpaid) b.push(`<span class="stf-warn">${c.unpaid} unpaid</span>`);
+    return b.join(' · ') + (rep.wages ? ` · wages ${fmtMoney(rep.wages)}` : '') + ((c.feed || 0) ? ` · hay ${fmtMoney(c.feed)}` : '');
+  },
+  hire(r, tier) {
+    const st = this.st(), R = STAFF_ROLES[r], T = STAFF_TIERS[tier]; if (!R || !T) return 'There\'s no such post.';
+    if (!this.unlocked(tier)) return `Reach stable level ${T.lvl} to hire ${gzA(T.name.toLowerCase())} ${R.name.toLowerCase()}.`;
+    const cur = st.hired[r]; if (cur && cur.tier === tier) return cur.name + ' already has the job.';
+    const w = this.wage(r, tier), owes = st.done[r] !== Game.s.day; if (owes && !Game.canAfford(w)) return `You need ${fmtMoney(w)} for the first day's wages.`;
+    const c = this.cand(r, tier); st.hired[r] = { tier, name: c.name, since: Game.s.day, unpaid: 0, skin: c.skin, hair: c.hair };
+    Game.news(cur ? `${c.name} took over from ${cur.name} as ${R.name.toLowerCase()}.` : `${c.name} joined the stable as ${R.name.toLowerCase()}.`);
+    const rep = this.work(r); Game.save(); this.syncRanch();
+    return { name: c.name, line: rep && rep.lines[r], starts: !owes };
+  },
+  fire(r) { const st = this.st(), p = st.hired[r]; if (!p) return null; delete st.hired[r]; Game.news(`${p.name} left the stable's ${STAFF_ROLES[r].name.toLowerCase()} post.`); Game.save(); this.syncRanch(); return p.name; },
+  syncRanch() { try { if (App.ranch && App.ranch._life) staffSync(App.ranch, App.ranch._life); } catch (e) { } },
+};
+// the morning round runs after everything else that happens overnight
+const _nextDayStf = Game.nextDay;
+Game.nextDay = function () { _nextDayStf.call(this); try { Staff.work(); } catch (e) { console.error(e); } };
+// one refresh for the whole round, not one per animal
+const _emitStf = Game.emit;
+Game.emit = function (ev, data) { if (Staff._quiet && ev === 'care') return; return _emitStf.call(this, ev, data); };
+// the morning toast
+const _appNextDayStf = App.nextDay;
+App.nextDay = async function () {
+  const r = await _appNextDayStf.apply(this, arguments);
+  try { const st = Staff.st(), rep = st.last; if (Staff.count() && rep && rep.day === Game.s.day) { const b = Staff.brief(rep); if (b) setTimeout(() => UI.toast(`<b>Staff</b> · ${b}`, ''), 700); } } catch (e) { }
+  return r;
+};
+// ---------------- screens ----------------
+UI.scr_staff = function () {
+  const st = Staff.st(), s = Game.s, n = Staff.count(), rep = st.last && st.last.day === s.day ? st.last : null;
+  const head = `<div class="spread" style="gap:10px"><div style="min-width:0"><h2>Staff</h2><div class="sub">${n ? `${n} hired · ${fmtMoney(Staff.wages())} a day in wages` : 'Help that looks after your animals every morning'}</div></div><button class="btn sm" data-act="nav" data-k="stable">Stable</button></div>`;
+  let body = '';
+  if (rep && Object.keys(rep.lines || {}).length) body += `<div class="card stf-rep"><div class="spread"><div class="eyebrow">This morning · day ${rep.day}</div>${rep.wages || (rep.c && rep.c.feed) ? `<span class="muted mono" style="font-size:11.5px">${rep.wages ? 'wages ' + fmtMoney(rep.wages) : ''}${rep.c && rep.c.feed ? (rep.wages ? ' · ' : '') + 'hay ' + fmtMoney(rep.c.feed) : ''}</span>` : ''}</div>
+    ${STAFF_SHOW.filter(r => rep.lines[r]).map(r => `<div class="stf-line"><span class="stf-li">${STAFF_ROLES[r].ico}</span><span>${esc(rep.lines[r])}</span></div>`).join('')}</div>`;
+  for (const r of STAFF_SHOW) {
+    const R = STAFF_ROLES[r], p = st.hired[r];
+    let inner = '';
+    if (p) {
+      const T = STAFF_TIERS[p.tier], up = p.tier < 2 ? p.tier + 1 : -1, upOk = up > 0 && Staff.unlocked(up), cov = Math.min(Staff.cap(p), s.horses.length);
+      inner = `<div class="stf-person"><div class="stf-av" style="background:${staffCss(STAFF_OUTFIT[r].shirt)}">${esc(p.name[0])}</div><div style="min-width:0"><div><b>${esc(p.name)}</b> <span class="tag">${T.name}</span></div>
+        <div class="muted" style="font-size:12px">${T.cap > 900 ? 'Looks after the whole stable' : `Looks after ${cov} of ${s.horses.length}`}${R.perk[p.tier] ? ' · ' + R.perk[p.tier] : ''} · ${fmtMoney(Staff.wage(r, p.tier))} a day</div>
+        ${p.unpaid ? `<div class="stf-warn">Unpaid for ${p.unpaid} day${p.unpaid > 1 ? 's' : ''}. Leaves after 3.</div>` : ''}</div></div>
+        <div class="row" style="gap:8px">${up > 0 ? `<button class="btn sm" style="flex:1" data-act="stfHire" data-k="${r}" data-t="${up}" ${upOk ? '' : 'disabled'}>${upOk ? `Upgrade to ${STAFF_TIERS[up].name} · ${fmtMoney(Staff.wage(r, up))}/day` : `${STAFF_TIERS[up].name} at level ${STAFF_TIERS[up].lvl}`}</button>` : ''}<button class="btn sm" ${up > 0 ? '' : 'style="flex:1"'} data-act="stfFire" data-k="${r}">Let go</button></div>`;
+    } else {
+      inner = `<div class="stf-tiers">${STAFF_TIERS.map((T, i) => { const c = Staff.cand(r, i), ok = Staff.unlocked(i); return `<div class="stf-tier ${ok ? '' : 'locked'}"><div style="min-width:0"><div><b>${T.name}</b> <span class="muted">· ${esc(c.name)}</span></div><div class="muted" style="font-size:11.5px">${T.cap > 900 ? 'Whole stable' : 'Up to ' + T.cap + ' animals'}${R.perk[i] ? ' · ' + R.perk[i] : ''}</div></div>
+        <div class="stf-wage">${fmtMoney(R.wage[i])}<small>/day</small></div>${ok ? `<button class="btn sm primary" data-act="stfHire" data-k="${r}" data-t="${i}">Hire</button>` : `<span class="stf-lock">Level ${T.lvl}</span>`}</div>`; }).join('')}</div>`;
+    }
+    body += `<div class="card stf-role ${p ? 'on' : ''}"><div class="stf-top"><span class="stf-ico">${R.ico}</span><div style="min-width:0"><div class="stf-rn">${R.name}</div><div class="muted" style="font-size:12px">${R.job}</div></div></div>${inner}</div>`;
+  }
+  if (st.hired.trainer && s.horses.length) {
+    const opts = [['auto', 'Best drill'], ...Object.entries(TRAININGS).map(([k, t]) => [k, t.name]), ['rest', 'Rest']];
+    body += `<div class="card"><div class="eyebrow">Training plans</div><div class="muted" style="font-size:12px;margin:4px 0 6px">Best drill works on whatever has the most room to grow. Rest keeps an animal fresh for a race.</div>
+      ${s.horses.slice().sort((a, b) => (b.fav ? 1 : 0) - (a.fav ? 1 : 0) || Game.rating(b) - Game.rating(a)).map(h => { const pl = Staff.plan(h), done = Staff.roomAll(h) < 0.5; return `<div class="stf-plan"><button class="stf-pic" data-act="openHorse" data-id="${h.id}" aria-label="${esc(h.name)}">${this.pic(h)}</button><div style="min-width:0;flex:1"><div class="stf-pn">${esc(h.name)}</div><div class="muted" style="font-size:11.5px">${Game.rating(h)} / ${Game.potential(h)}${done ? ' · fully trained' : ''} · energy ${Math.round(h.care.energy)}</div></div>
+        <select data-chg="stfPlan" data-id="${h.id}" aria-label="Training plan for ${esc(h.name)}">${opts.map(([k, l]) => `<option value="${k}" ${pl === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`; }).join('')}</div>`;
+  }
+  body += `<div class="hint">Staff work each morning when the new day starts, and straight away on the day you hire them. Wages come out of your purse every day. Anyone who isn't paid stops working, and leaves after three days.</div>`;
+  return { head, body };
+};
+function staffCss(c) { return `rgb(${c.map(v => Math.round(v * 255)).join(',')})`; }
+const _scrStableStf = UI.scr_stable;
+UI.scr_stable = function () {
+  const r = _scrStableStf.call(this);
+  try {
+    const st = Staff.st(), on = STAFF_SHOW.filter(k => st.hired[k]), unpaid = on.some(k => st.hired[k].unpaid);
+    const chips = on.map(k => `<span class="tag">${STAFF_ROLES[k].ico} ${esc(st.hired[k].name.split(' ')[0])}</span>`).join('');
+    r.body = `<button class="card stf-sum" data-act="stfOpen"><div style="min-width:0;flex:1;text-align:left"><div class="eyebrow">Staff</div>${on.length ? `<div class="row wrap" style="gap:6px;margin-top:6px">${chips}</div><div class="muted" style="font-size:12px;margin-top:6px">${fmtMoney(Staff.wages())} a day${unpaid ? ' · <span class="stf-warn">wages unpaid</span>' : ''}</div>` : `<div class="muted" style="font-size:12.5px;margin-top:4px">Hire a groom, trainer, vet and head lad to look after your animals every morning.</div>`}</div><span class="btn sm">${on.length ? 'Manage' : 'Hire staff'}</span></button>` + r.body;
+  } catch (e) { console.error(e); }
+  return r;
+};
+// the training plan on the animal's own Train tab
+const _scrHorseStf = UI.scr_horse;
+UI.scr_horse = function () {
+  const r = _scrHorseStf.call(this);
+  try {
+    const h = Game.find(this.horseId), t = Staff.hired('trainer');
+    if (h && t && this.screen === 'horse' && this.horseTab === 'train') {
+      const pl = Staff.plan(h), opts = [['auto', 'Best drill'], ...Object.entries(TRAININGS).map(([k, x]) => [k, x.name]), ['rest', 'Rest']];
+      const card = `<div class="card stf-plan" style="margin:0"><span class="stf-ico sm">⏱️</span><div style="min-width:0;flex:1"><div class="stf-pn">Trainer's plan</div><div class="muted" style="font-size:11.5px">${esc(t.name)} trains ${esc(h.name)} each morning</div></div><select data-chg="stfPlan" data-id="${h.id}" aria-label="Training plan">${opts.map(([k, l]) => `<option value="${k}" ${pl === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`;
+      const i = r.body.indexOf('<div class="tabs">'), j = i >= 0 ? r.body.indexOf('</div>', i) : -1;
+      r.body = j >= 0 ? r.body.slice(0, j + 6) + card + r.body.slice(j + 6) : r.body + card;
+    }
+  } catch (e) { console.error(e); }
+  return r;
+};
+const _renderDockStf = UI.renderDock;
+UI.renderDock = function () { _renderDockStf.call(this); if (this.screen === 'staff') document.querySelectorAll('#dock .nav').forEach(b => b.classList.toggle('on', b.dataset.k === 'stable')); };
+const _uiActStf = UI.act;
+UI.act = function (k, el, ev) {
+  if (k === 'stfOpen') { this.go('staff'); return; }
+  if (k === 'stfHire') { const r = Staff.hire(el.dataset.k, +el.dataset.t); if (typeof r === 'string') this.toast(esc(r), 'bad'); else { Audio2.coin && Audio2.coin(); this.toast(`${esc(r.name)} is on the payroll.` + (r.starts ? ' Starts work tomorrow morning.' : r.line ? ' ' + esc(r.line) : ''), 'good'); } this.refresh(); this.renderTop(); return; }
+  if (k === 'stfFire') { const n = Staff.fire(el.dataset.k); if (n) this.toast(esc(n) + ' has left the stable.', ''); this.refresh(); return; }
+  return _uiActStf.call(this, k, el, ev);
+};
+const _uiChgStf = UI.chg;
+UI.chg = function (a, el, ev) {
+  if (a === 'stfPlan') { const st = Staff.st(), v = el.value; if (v === 'auto') delete st.plans[el.dataset.id]; else st.plans[el.dataset.id] = v; Game.save(); return; }
+  return _uiChgStf.call(this, a, el, ev);
+};
+// staff walk the estate: each follows one of the stable hands' rounds, in their own colours
+function staffSync(view, L) {
+  const S = view.S; if (!S || !S.estate || !L.hands || L.hands.length < 2) return;
+  if (!L.staff) L.staff = []; const st = Staff.st();
+  for (const o of L.staff.slice()) { const p = st.hired[o.role]; if (!p || p.name !== o.name) { const drop = it => { const i = S.items.indexOf(it); if (i >= 0) S.items.splice(i, 1); const j = L.items.indexOf(it); if (j >= 0) L.items.splice(j, 1); }; drop(o.av.item); L.staff.splice(L.staff.indexOf(o), 1); } }
+  for (const r of STAFF_SHOW) {
+    const p = st.hired[r]; if (!p || L.staff.some(o => o.role === r)) continue;
+    const [ri, i0] = STAFF_ROUTE[r], rt = L.hands[ri].rt, pal = Object.assign({ skin: STAFF_SKIN[p.skin || 0], hair: STAFF_HAIR[p.hair || 0] }, STAFF_OUTFIT[r]);
+    const av = new Avatar(E, pal), wp = rt[i0 % rt.length]; S.items.push(av.item); L.items.push(av.item);
+    L.staff.push({ role: r, name: p.name, av, rt, i: i0 % rt.length, pos: [wp[0], 0, wp[1]], yaw: Math.random() * TAU, spd: 0, wait: 1 + Math.random() * 4, act: null, yT: 0, noYield: 0 });
+  }
+}
+function staffTick(view, L, dt) {
+  if (!L.staff || !L.staff.length) return;
+  const gr = view.S.ground || (() => 0), W = typeof Walk !== 'undefined' && Walk.active ? Walk : null, all = L.hands.concat(L.staff);
+  for (const h of L.staff) {
+    let spd = 0; const wp = h.rt[h.i];
+    if (h.wait > 0) { h.wait -= dt; if (h.act) { h.act.t += dt; if (h.act.t >= h.act.dur) h.act = null; } if (h.wait <= 0) h.i = (h.i + 1) % h.rt.length; }
+    else {
+      let block = false;   // give way to anyone just ahead on the path, but never stand about for long
+      if (h.noYield > 0) h.noYield -= dt; else for (const o of all) { if (o === h) continue; const dx = o.pos[0] - h.pos[0], dz = o.pos[2] - h.pos[2], d = Math.hypot(dx, dz); if (d < 1.5 && Math.cos(h.yaw) * dx - Math.sin(h.yaw) * dz > 0.35 * d) { block = true; break; } }
+      if (block) { h.yT += dt; if (h.yT > 2.5) { h.noYield = 3; h.yT = 0; } }
+      else {
+        h.yT = 0; const dx = wp[0] - h.pos[0], dz = wp[1] - h.pos[2], d = Math.hypot(dx, dz), want = Math.atan2(-dz, dx);
+        h.yaw += clamp(wrapAngle(want - h.yaw), -2.4 * dt, 2.4 * dt); const go = d > 0.25 ? 1.2 * clamp(1 - Math.abs(wrapAngle(want - h.yaw)) / 1.6, 0.15, 1) : 0;
+        h.pos[0] += Math.cos(h.yaw) * go * dt; h.pos[2] -= Math.sin(h.yaw) * go * dt; spd = go;
+        if (d < 0.4) { h.wait = wp[2] ? 3.5 + Math.random() * 3 : 0.3; if (wp[2]) h.act = { type: wp[2], t: 0, dur: wp[2] === 'wave' ? 2.2 : 3.4 }; if (wp[2] === 'wave' && !(W || view.oc)) h.act = null; }
+      }
+    }
+    h.spd = damp(h.spd, spd, 6, dt); h.pos[1] = gr(h.pos[0], h.pos[2]);
+    let lookYaw = 0; if (W) { const dx = W.pos[0] - h.pos[0], dz = W.pos[2] - h.pos[2]; if (Math.hypot(dx, dz) < 6) lookYaw = clamp(wrapAngle(Math.atan2(-dz, dx) - h.yaw), -1, 1); }
+    h.av.pose(dt, { speed: h.spd, act: h.act, lookYaw }); m4.rotY(h.yaw, h.pos, 1, h.av.model);
+  }
+}
+const _rvUpdateStf = RanchView.prototype.update;
+RanchView.prototype.update = function (dt) {
+  _rvUpdateStf.call(this, dt);
+  const L = this._life; if (!L || !this.S || L.S !== this.S) return;
+  try { L._stfT = (L._stfT || 0) - dt; if (L._stfT <= 0) { L._stfT = 2; staffSync(this, L); } staffTick(this, L, dt); } catch (e) { console.warn('staff', e); L.staff = []; }
+};
+// styles
+(function staffStyles() {
+  const css = `.stf-sum{display:flex;align-items:center;gap:12px;width:100%;color:inherit;font:inherit;cursor:pointer;margin-bottom:12px}.stf-sum:hover{border-color:var(--line-2)}
+.stf-role{display:flex;flex-direction:column;gap:10px;margin-bottom:10px}.stf-role.on{border-color:rgba(232,176,75,.35);background:linear-gradient(180deg,rgba(232,176,75,.07),rgba(255,255,255,.03))}
+.stf-top{display:flex;gap:10px;align-items:flex-start}.stf-ico{flex:none;width:38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:19px;background:rgba(255,255,255,.06);border:1px solid var(--line)}.stf-ico.sm{width:32px;height:32px;font-size:16px}
+.stf-rn{font:700 15px var(--f-body)}.stf-tiers{display:flex;flex-direction:column;gap:6px}
+.stf-tier{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.035);border:1px solid var(--line)}.stf-tier.locked{opacity:.55}
+.stf-wage{font:700 13px var(--f-mono);white-space:nowrap}.stf-wage small{font-weight:400;color:var(--muted);font-size:10.5px}.stf-lock{font-size:11.5px;color:var(--muted);white-space:nowrap}
+.stf-person{display:flex;gap:10px;align-items:center}.stf-av{flex:none;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;font:700 15px var(--f-body);color:#111;border:2px solid rgba(255,255,255,.25)}
+.stf-warn{color:var(--amber);font-size:12px;margin-top:3px}.stf-rep{margin-bottom:10px;display:flex;flex-direction:column;gap:6px}.stf-line{display:flex;gap:8px;font-size:12.5px;line-height:1.4}.stf-li{flex:none;width:20px;text-align:center}
+.stf-plan{display:flex;gap:10px;align-items:center;padding:7px 0;border-top:1px solid var(--line)}.card.stf-plan{border-top:1px solid var(--line);padding:10px 12px}.stf-plan:first-of-type{border-top:0}
+.stf-pic{flex:none;position:relative;width:52px;height:39px;border-radius:8px;overflow:hidden;padding:0;border:1px solid var(--line);background:radial-gradient(ellipse at 50% 70%,#1d2236,#0b0e18);cursor:pointer}.stf-pic img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .4s}.stf-pic img.ready{opacity:1}
+.stf-pn{font-weight:700;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stf-plan select{flex:none;max-width:132px;height:32px;padding:0 8px;border-radius:9px;background:rgba(255,255,255,.05);border:1px solid var(--line-2);font-size:12px}.stf-plan select option{background:#12172a}`;
+  const put = () => { const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st); };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', put); else put();
+})();
+// ---------------- dev console ----------------
+DevConsole.cmds.staff = function (a) {
+  const sub = (a[0] || '').toLowerCase(), roles = a[1] === 'all' ? STAFF_SHOW : a[1] ? [Object.keys(STAFF_ROLES).find(k => k === a[1] || STAFF_ROLES[k].name.toLowerCase().startsWith(a[1]))].filter(Boolean) : [];
+  if (sub === 'open') { DevConsole.toggle(false); UI.go('staff'); return 'Staff screen.'; }
+  if (sub === 'hire') { if (!roles.length) return 'staff hire <groom|trainer|vet|lad|all> [1-3]'; const t = clamp((parseInt(a[2]) || 3) - 1, 0, 2), lv = Game.s.level; Game.s.level = Math.max(lv, STAFF_TIERS[t].lvl);   // the console skips the level lock
+    let out; try { out = roles.map(r => { const x = Staff.hire(r, t); return STAFF_ROLES[r].name + ': ' + (typeof x === 'string' ? x : x.name + ' (' + STAFF_TIERS[t].name + ')'); }); } finally { Game.s.level = lv; } UI.refresh(); UI.renderTop(); return out.join('\n'); }
+  if (sub === 'fire') { if (!roles.length) return 'staff fire <groom|trainer|vet|lad|all>'; const out = roles.map(r => STAFF_ROLES[r].name + ': ' + (Staff.fire(r) || 'nobody hired')); UI.refresh(); return out.join('\n'); }
+  if (sub === 'work') { if (!Staff.count()) return 'Nobody hired. Try: staff hire all'; const r = Staff.work(null, true); UI.refresh(); return r ? STAFF_SHOW.filter(k => r.lines[k]).map(k => STAFF_ROLES[k].name + ': ' + r.lines[k]).join('\n') : 'Nothing to do.'; }
+  if (sub === 'pay') { const st = Staff.st(); for (const k in st.hired) st.hired[k].unpaid = 0; Game.save(); UI.refresh(); return 'Back pay settled.'; }
+  const st = Staff.st(); if (!Staff.count()) return 'No staff. staff hire <role|all> [1-3] · staff open';
+  return STAFF_SHOW.filter(k => st.hired[k]).map(k => { const p = st.hired[k]; return `${STAFF_ROLES[k].name}: ${p.name}, ${STAFF_TIERS[p.tier].name}, ${fmtMoney(Staff.wage(k, p.tier))}/day${p.unpaid ? ', unpaid ' + p.unpaid + 'd' : ''}`; }).join('\n') + '\nWages ' + fmtMoney(Staff.wages()) + ' a day';
+};
+DEV_NEW_HELP.push('staff [open|hire <role|all> [1-3]|fire <role|all>|work|pay]   hired help: list, hire (1 apprentice … 3 master), let go, run a morning now, clear unpaid days');
+DEV_TOOLS.push({ id: 'staff', cat: 'content', title: 'Staff', desc: 'Grooms, trainers, vets and head lads who look after the stable each morning.', kw: 'staff workers hire groom trainer vet head lad wages employees helpers automatic care training', ui: 'btns', btns: [['Open staff', 'staff open'], ['Hire master team', 'staff hire all 3', 1], ['Run a morning', 'staff work'], ['Let everyone go', 'staff fire all']] });
 
 </script>
 <script>if('serviceWorker' in navigator && location.protocol === 'https:') addEventListener('load', () => navigator.serviceWorker.register('sw.js').then(r => r.addEventListener('updatefound', () => { const w = r.installing; if (w) w.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) { try { UI.toast('A new version has downloaded. Close and reopen the app to play it.', 'gold'); } catch (e) { } } }); })).catch(() => { }));</script></body></html>
