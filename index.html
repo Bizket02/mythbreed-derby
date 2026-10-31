@@ -1087,31 +1087,40 @@ class Engine {
 
   // ---------------- programs ----------------
   register(name, vs, fs) { this.sources[name] = { vs, fs }; }
+  _key(name, defines) { return name + '|' + Object.keys(defines).sort().map(k => k + '=' + defines[k]).join(','); }
   program(name, defines = {}) {
-    const key = name + '|' + Object.keys(defines).sort().map(k => k + '=' + defines[k]).join(',');
+    const key = this._key(name, defines);
     let p = this.programs.get(key); if (p) return p;
+    const pj = this._pending && this._pending.get(key);   // still compiling in the background: wait for it here
+    p = this._finish(pj || this._begin(name, defines, key)); if (pj) this._pending.delete(key);
+    this.programs.set(key, p); return p;
+  }
+  // start compiling and linking without asking how it went: with KHR_parallel_shader_compile the driver works on it in the background
+  _begin(name, defines, key) {
     const src = this.sources[name]; if (!src) throw new Error('no shader ' + name);
     const defs = Object.entries(defines).map(([k, v]) => `#define ${k} ${v}`).join('\n');
     const head = `#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2DShadow;\nprecision highp sampler2D;\n#define MAX_BONES ${MAX_BONES}\n${defs}\n`;
-    p = this._link(head + src.vs, head + src.fs, key);
-    this.programs.set(key, p); return p;
-  }
-  _compile(type, src, key) {
-    const gl = this.gl, s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-      const log = gl.getShaderInfoLog(s); const lines = src.split('\n');
-      const m = /ERROR: \d+:(\d+)/.exec(log); let ctx = '';
-      if (m) { const ln = +m[1]; ctx = lines.slice(Math.max(0, ln - 3), ln + 2).map((l, i) => (ln - 2 + i) + ': ' + l).join('\n'); }
-      throw new Error('Shader compile (' + key + '): ' + log + '\n' + ctx);
-    }
-    return s;
-  }
-  _link(vsSrc, fsSrc, key) {
-    const gl = this.gl, prog = gl.createProgram();
-    gl.attachShader(prog, this._compile(gl.VERTEX_SHADER, vsSrc, key)); gl.attachShader(prog, this._compile(gl.FRAGMENT_SHADER, fsSrc, key));
+    const gl = this.gl, prog = gl.createProgram(), vsSrc = head + src.vs, fsSrc = head + src.fs;
+    const sh = (type, txt) => { const o = gl.createShader(type); gl.shaderSource(o, txt); gl.compileShader(o); gl.attachShader(prog, o); return o; };
+    const vs = sh(gl.VERTEX_SHADER, vsSrc), fs = sh(gl.FRAGMENT_SHADER, fsSrc);
     for (const [n, l] of Object.entries(ATTR)) gl.bindAttribLocation(prog, l, n);
     gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error('Link (' + key + '): ' + gl.getProgramInfoLog(prog));
+    return { key, prog, vs, fs, vsSrc, fsSrc };
+  }
+  _shaderErr(o, src, key) {
+    const log = this.gl.getShaderInfoLog(o) || '', lines = src.split('\n');
+    const m = /ERROR: \d+:(\d+)/.exec(log); let ctx = '';
+    if (m) { const ln = +m[1]; ctx = lines.slice(Math.max(0, ln - 3), ln + 2).map((l, i) => (ln - 2 + i) + ': ' + l).join('\n'); }
+    return new Error('Shader compile (' + key + '): ' + log + '\n' + ctx);
+  }
+  _finish(j) {
+    const gl = this.gl, prog = j.prog, key = j.key;
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      if (gl.isContextLost()) throw new Error('The graphics card stopped responding (WebGL context lost) while preparing ' + key);
+      if (!gl.getShaderParameter(j.vs, gl.COMPILE_STATUS)) throw this._shaderErr(j.vs, j.vsSrc, key);
+      if (!gl.getShaderParameter(j.fs, gl.COMPILE_STATUS)) throw this._shaderErr(j.fs, j.fsSrc, key);
+      throw new Error('Link (' + key + '): ' + gl.getProgramInfoLog(prog));
+    }
     const P = { prog, u: {}, texUnit: 0, samplers2D: [] };
     const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS);
     for (let i = 0; i < n; i++) {
@@ -1137,6 +1146,29 @@ class Engine {
     P.set = (name, v) => { const f = P.u[name]; if (f && v !== undefined) f(v); };
     return P;
   }
+
+  // compile many programs at once in the background, so the page stays responsive and can show progress (Windows compiles big shaders slowly)
+  async warm(list, onProg) {
+    const gl = this.gl; if (this._par === undefined) { this._par = gl.getExtension('KHR_parallel_shader_compile') || null; try { if (this._par && this._par.maxShaderCompilerThreadsKHR) this._par.maxShaderCompilerThreadsKHR(0xFFFFFFFF); } catch (e) { } }
+    const jobs = [], seen = new Set(); if (!this._pending) this._pending = new Map();
+    for (const [name, d] of list) { const defines = d || {}, key = this._key(name, defines); if (!this.sources[name] || this.programs.has(key) || this._pending.has(key) || seen.has(key)) continue; seen.add(key); jobs.push([name, defines, key]); }
+    const n = jobs.length; if (!n) return 0; const tick = () => new Promise(r => setTimeout(r, 16));
+    if (!this._par) { for (let i = 0; i < n; i++) { onProg && onProg(i, n); await tick(); this.program(jobs[i][0], jobs[i][1]); } onProg && onProg(n, n); return n; }
+    const js = jobs.map(([nm, d, k]) => { const j = this._begin(nm, d, k); this._pending.set(k, j); return j; });
+    for (let done = 0; done < n;) {
+      await new Promise(r => setTimeout(r, 50)); if (gl.isContextLost()) break;
+      done = 0; for (const j of js) { if (!j.ok && gl.getProgramParameter(j.prog, this._par.COMPLETION_STATUS_KHR)) j.ok = true; if (j.ok) done++; }
+      onProg && onProg(done, n);
+    }
+    for (const j of js) if (this._pending.get(j.key) === j) { this._pending.delete(j.key); this.programs.set(j.key, this._finish(j)); }
+    return n;
+  }
+  sceneKeys(scene) {   // every program a scene's items need: the main pass, and the depth pass for shadow casters
+    const out = [];
+    for (const it of scene.items || []) { if (!it || !it.shader) continue; const d = Object.assign({}, it.defines || {}); out.push([it.shader, d]); if (it.castShadow) out.push([it.depthShader || it.shader, Object.assign({}, d, { DEPTH: 1 })]); }
+    return out;
+  }
+  postKeys() { return ['sky', 'ssao', 'aoBlur', 'dofBlur', 'rays', 'bloomDown', 'bloomUp', 'composite', 'fxaa'].filter(k => this.sources[k]).map(k => [k, {}]); }
 
   // ---------------- meshes ----------------
   createMesh(def) {
@@ -22318,22 +22350,31 @@ const App = {
     registerShaders(E);
     if (typeof Save !== 'undefined') { const st = await Save.boot(t => { $('#loadMsg').textContent = t; }); Game.init(st === undefined ? undefined : st); }   // newest of this browser's save and the player's account save
     else Game.init();
+    // a load that never finished last time (a frozen or closed tab) starts this one on the phone's graphics level
+    let safe = false; try { safe = localStorage.getItem('mbd_boot') === 'pending'; localStorage.setItem('mbd_boot', 'pending'); } catch (e) { }
+    if (safe && Game.s.settings.quality !== 'low') { this._safeFrom = Game.s.settings.quality; Game.s.settings.quality = 'low'; Game.save(); }
     this.applyQuality(true);
     Audio2.on = Game.s.settings.sound;
     E.resize();
     const msg = (t, p) => { $('#loadMsg').textContent = t; if (p !== undefined) $('#loadBar').style.width = Math.round(p * 100) + '%'; };
-    msg('Building the ranch', 0.1);
+    msg('Building the ranch', 0.05);
     await new Promise(r => setTimeout(r, 30));
-    try { for (const k of ['std', 'ground', 'horse', 'hair']) { E.program(k, {}); } } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
     this.ranch = new RanchView(); this.studio = new StudioView(); this.race = new RaceView();
+    const gfx = (t, a, b) => (d, n) => msg(t + ' · ' + Math.round(100 * d / Math.max(1, n)) + '%', a + (b - a) * d / Math.max(1, n));
+    msg('Preparing the graphics', 0.1); await new Promise(r => setTimeout(r, 30));
+    try { await E.warm(E.sceneKeys(this.ranch.S).concat(E.postKeys()), gfx('Preparing the graphics', 0.1, 0.3)); } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
     msg('Breeding the herd', 0.3);
     UI.init(); Viewer.init(); DevConsole.lines = [];
     this.ranch.sync();
     const t0 = performance.now();
     await new Promise(res => { const chk = () => { const total = this.ranch.rigs.size; const have = [...this.ranch.rigs.values()].filter(e => e.rig).length; msg('Breeding the herd · ' + have + ' of ' + total, 0.3 + 0.65 * (total ? have / total : 1)); if (have >= total || performance.now() - t0 > 20000) res(); else setTimeout(chk, 120); }; chk(); });
+    try { this.ranch.update(0.016); } catch (e) { }   // brings the yard to life (stable hands, birds, staff) so their shaders are ready before the first frame too
+    try { await E.warm(E.sceneKeys(this.ranch.S), gfx('Saddling the herd', 0.95, 1)); } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
     this.bindInput();
     this.last = performance.now(); requestAnimationFrame(t => this.frame(t));
     msg('Ready', 1);
+    try { localStorage.setItem('mbd_boot', 'ok'); } catch (e) { }
+    if (this._safeFrom) setTimeout(() => UI.toast('The last load didn\'t finish, so the game started on low graphics. You can raise it in Settings.', 'gold'), 1500);
     setTimeout(() => { $('#fade').classList.add('off'); if (Game.s.tutorial) UI.tutorial(); }, 250);
     this.ready = true; this.syncWalkBtn();
     try { window.claude?.hot?.snapshot?.(() => { Game.save(); return { v: 1 }; }); } catch (e) { }
@@ -22557,7 +22598,9 @@ const App = {
     window.addEventListener('resize', () => E.resize());
   },
 };
-window.addEventListener('DOMContentLoaded', () => App.init());
+window.addEventListener('DOMContentLoaded', () => { App.init().catch(e => { console.error(e); const m = $('#loadMsg'); if (m && !App.ready) m.textContent = 'Something went wrong while loading: ' + (e && e.message || e); }); });
+window.addEventListener('error', e => { const m = $('#loadMsg'); if (m && typeof App !== 'undefined' && !App.ready && e && e.message) m.textContent = 'Something went wrong while loading: ' + e.message; });
+document.addEventListener('webglcontextlost', e => { e.preventDefault(); const m = $('#loadMsg'); if (typeof App !== 'undefined' && !App.ready) { if (m) m.textContent = 'The graphics card stopped responding. Reload the page: the game will start on lower graphics.'; } else if (typeof UI !== 'undefined') UI.toast('The graphics card stopped responding. Reload the page to carry on.', 'bad'); }, true);
 
 /* ============================================================
    WALK MODE — explore the ranch on foot as a rancher. Horses
