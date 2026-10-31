@@ -1148,15 +1148,17 @@ class Engine {
   }
 
   // compile many programs at once in the background, so the page stays responsive and can show progress (Windows compiles big shaders slowly)
-  async warm(list, onProg) {
+  async warm(list, onProg, maxMs = 0) {
     const gl = this.gl; if (this._par === undefined) { this._par = gl.getExtension('KHR_parallel_shader_compile') || null; try { if (this._par && this._par.maxShaderCompilerThreadsKHR) this._par.maxShaderCompilerThreadsKHR(0xFFFFFFFF); } catch (e) { } }
     const jobs = [], seen = new Set(); if (!this._pending) this._pending = new Map();
     for (const [name, d] of list) { const defines = d || {}, key = this._key(name, defines); if (!this.sources[name] || this.programs.has(key) || this._pending.has(key) || seen.has(key)) continue; seen.add(key); jobs.push([name, defines, key]); }
     const n = jobs.length; if (!n) return 0; const tick = () => new Promise(r => setTimeout(r, 16));
     if (!this._par) { for (let i = 0; i < n; i++) { onProg && onProg(i, n); await tick(); this.program(jobs[i][0], jobs[i][1]); } onProg && onProg(n, n); return n; }
     const js = jobs.map(([nm, d, k]) => { const j = this._begin(nm, d, k); this._pending.set(k, j); return j; });
+    const t0 = performance.now();
     for (let done = 0; done < n;) {
       await new Promise(r => setTimeout(r, 50)); if (gl.isContextLost()) break;
+      if (maxMs && performance.now() - t0 > maxMs) { this.lazy = true; return n; }   // still going: carry on in the background, the frames skip what isn't ready
       done = 0; for (const j of js) { if (!j.ok && gl.getProgramParameter(j.prog, this._par.COMPLETION_STATUS_KHR)) j.ok = true; if (j.ok) done++; }
       onProg && onProg(done, n);
     }
@@ -1391,11 +1393,22 @@ class Engine {
     const key = depth ? '_pd' : '_pm';
     if (!it[key]) {
       const defs = Object.assign({}, it.defines || {}); if (depth) defs.DEPTH = 1;
-      it[key] = this.program(depth ? (it.depthShader || it.shader) : it.shader, defs);
+      const name = depth ? (it.depthShader || it.shader) : it.shader;
+      if (this.lazy && this._par) {   // never stall a frame on a shader that is still compiling: draw without the item until it's ready
+        const k = this._key(name, defs);
+        if (!this.programs.has(k)) {
+          if (!this._pending) this._pending = new Map();
+          let j = this._pending.get(k); if (!j) { j = this._begin(name, defs, k); this._pending.set(k, j); }
+          if (!this.gl.getProgramParameter(j.prog, this._par.COMPLETION_STATUS_KHR)) return null;
+          this._pending.delete(k); this.programs.set(k, this._finish(j));
+        }
+      }
+      it[key] = this.program(name, defs);
       if (!depth) it._pk = this.programs.size; // rough program grouping
     }
     return it[key];
   }
+  sceneReady(scene) { let ok = true; for (const it of scene.items || []) { if (!it || !it.shader || it.visible === false) continue; if (!this._progFor(it, false)) ok = false; if (it.castShadow && !this._progFor(it, true)) ok = false; } return ok; }
 
   render(scene, cam, opts = {}) {
     const gl = this.gl;
@@ -1413,7 +1426,7 @@ class Engine {
       for (const it of scene.items) {
         if (it.visible === false || !it.castShadow) continue;
         if (it.bounds && !this._inView(it, sp, it.shadowDist ? scene.shadow.center : null)) continue;
-        const P = this._progFor(it, true); if (P !== last) { gl.useProgram(P.prog); this._frameUniforms(P, scene, cam, true); last = P; }
+        const P = this._progFor(it, true); if (!P) continue; if (P !== last) { gl.useProgram(P.prog); this._frameUniforms(P, scene, cam, true); last = P; }
         this._drawItem(it, P, true);
       }
       gl.colorMask(true, true, true, true);
@@ -1427,7 +1440,7 @@ class Engine {
     let last = null;
     const drawList = (list) => {
       for (const it of list) {
-        const P = this._progFor(it, false); if (P !== last) { gl.useProgram(P.prog); this._frameUniforms(P, scene, cam, false); last = P; }
+        const P = this._progFor(it, false); if (!P) continue; if (P !== last) { gl.useProgram(P.prog); this._frameUniforms(P, scene, cam, false); last = P; }
         if (it.cull === false) gl.disable(gl.CULL_FACE); else { gl.enable(gl.CULL_FACE); gl.cullFace(it.cullFront ? gl.FRONT : gl.BACK); }
         if (it.blend === 'add') { gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); }
         else if (it.blend === 'padd') { gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); }
@@ -2275,6 +2288,7 @@ void statueSurf(inout Surf s, vec3 p, float cav){
 }
 `;
 const FS_HORSE = FS_HEAD + GLSL_NOISE + GLSL_LIGHT + GLSL_STATUE + `
+uniform int uZero;   // always 0: hides the loop counts from the compiler so Windows (D3D) keeps real loops instead of unrolling them, which made this shader take minutes to compile there
 uniform vec3 uBase, uPoints, uMuzzle, uHoof, uEye, uExoA, uExoB, uExoC, uGlowCol, uChimeraCol, uHornCol, uMane;
 uniform float uPointsAmt, uPangare, uSooty, uDun, uDapple, uGrey, uRoan, uEyeGlow, uGlow, uChimera, uGhost, uSeed, uExo, uHornGlow, uFlaxen, uSkinPink, uAge;
 uniform vec4 uCare;   // the creature's condition from the game: [mud, groomed gloss, age grey, fitness]
@@ -2310,13 +2324,13 @@ float avFeShape(vec2 uv, float h){ float w = 0.62 + 0.12*h, ac = 0.48 - w/1.3; r
 // z: its id, w: the gap behind the edge of the nearest feather lying over it (where that feather's shade falls)
 vec4 avFeathers(vec3 q, vec3 t, vec3 b, vec3 n, float sd){
   vec3 ci = floor(q); float us[27], es[27]; float bu = -9.0; vec4 own = vec4(-0.05, 0.0, 0.5, 9.0); int m = 0;
-  for(int k = -1; k <= 1; k++) for(int j = -1; j <= 1; j++) for(int i = -1; i <= 1; i++){
+  for(int k = -1; k <= 1 + uZero; k++) for(int j = -1; j <= 1 + uZero; j++) for(int i = -1; i <= 1 + uZero; i++){
     vec3 cc = ci + vec3(float(i), float(j), float(k)), h = hash33(cc + sd*7.3); vec3 d = q - cc - 0.15 - 0.7*h;
     float u = dot(d, t), v = dot(d, b), e = abs(dot(d, n)) > 0.72 ? -9.0 : avFeShape(vec2(u, v), h.z);
     us[m] = u; es[m] = e; m++;
     if(e > 0.0 && u > bu){ bu = u; own = vec4(e, v/(0.62 + 0.12*h.z), h.x, 9.0); }
   }
-  for(int i = 0; i < 27; i++) if(us[i] > bu && es[i] > -8.0) own.w = min(own.w, -es[i]);
+  for(int i = 0; i < 27 + uZero; i++) if(us[i] > bu && es[i] > -8.0) own.w = min(own.w, -es[i]);
   return own;
 }
 // one layer of plumage at lattice scale sc: per-feather tone, rachis and barbs, fringes, streaks, bars and spots, the shade each tip casts
@@ -2354,7 +2368,7 @@ vec3 avPlume(vec3 c, vec3 p, float sc, vec3 t, vec3 b, vec3 n, float pfw, float 
 uniform vec4 uRpC, uRpD, uRpE, uRpF, uRpG, uRpN0, uRpN1, uRpN2, uRpN3, uSnT, uSnT2, uSnP; uniform vec3 uSnPA, uSnPB;
 // the nearest scale of a jittered cell grid: [distance to its centre, distance to its edge, hash]; cc its centre
 vec3 rpCell(vec3 q, out vec3 cc){ vec3 i = floor(q), f = fract(q); float d1 = 8.0, d2 = 8.0, id = 0.0; cc = q;
-  for(int k = -1; k <= 1; k++) for(int j = -1; j <= 1; j++) for(int l = -1; l <= 1; l++){ vec3 b = vec3(float(l), float(j), float(k)), r = b + 0.1 + hash33(i + b)*0.8 - f; float d = dot(r, r);
+  for(int k = -1; k <= 1 + uZero; k++) for(int j = -1; j <= 1 + uZero; j++) for(int l = -1; l <= 1 + uZero; l++){ vec3 b = vec3(float(l), float(j), float(k)), r = b + 0.1 + hash33(i + b)*0.8 - f; float d = dot(r, r);
     if(d < d1){ d2 = d1; d1 = d; id = hash13(i + b + 3.7); cc = q + r; } else if(d < d2) d2 = d; }
   d1 = sqrt(d1); return vec3(d1, sqrt(d2) - d1, id); }
 // one layer of scales at density f (per rest unit) carved as relief: sh 0 round beads .. 1 overlapping shingles whose free tips point along D
@@ -2388,7 +2402,7 @@ vec4 rpImb(vec2 q, float ov, float kl, float px, out vec2 qc){
 // the line's direction there; returns the distance
 float rpNeck(vec2 q, out float s, out vec2 c, out vec2 t){ vec2 P[8]; P[0] = uRpN0.xy; P[1] = uRpN0.zw; P[2] = uRpN1.xy; P[3] = uRpN1.zw; P[4] = uRpN2.xy; P[5] = uRpN2.zw; P[6] = uRpN3.xy; P[7] = uRpN3.zw;
   float bd = 1e9, acc = 0.0; s = 0.0; c = P[0]; t = vec2(1.0, 0.0);
-  for(int i = 0; i < 7; i++){ vec2 a = P[i], e = P[i + 1] - a; float L2 = max(dot(e, e), 1e-8), Ls = sqrt(L2), h = clamp(dot(q - a, e)/L2, i == 0 ? -6.0 : 0.0, i == 6 ? 6.0 : 1.0); vec2 b = a + e*h; float d = length(q - b);
+  for(int i = 0; i < 7 + uZero; i++){ vec2 a = P[i], e = P[i + 1] - a; float L2 = max(dot(e, e), 1e-8), Ls = sqrt(L2), h = clamp(dot(q - a, e)/L2, i == 0 ? -6.0 : 0.0, i == 6 ? 6.0 : 1.0); vec2 b = a + e*h; float d = length(q - b);
     if(d < bd){ bd = d; c = b; t = e/Ls; s = acc + h*Ls; } acc += Ls; }
   return bd; }
 // a snake's body (05v): [arc length from the head back, angle round the body (0 along the spine, +-pi under the belly), radius, scale rows from the
@@ -2398,7 +2412,7 @@ vec4 snCoord(vec3 p){ float T = uSnT.x, tl = max(uSnT.y, 1e-3), r0 = uSnT.z, nl 
   if(sn > 0.0){ c = cn; up = vec2(-tn.y, tn.x); r = r0*mix(1.0, 0.78, clamp(sn/max(nl, 1e-3), 0.0, 1.0)); s = nl - sn; R = s/L0; }
   else if(p.x > -T){ s = nl + T - p.x; R = s/L0; }
   else { float g = clamp((-T - p.x)/tl, 0.0, 1.0); r = r0*(1.0 - 0.88*pow(g, 1.6)); c.y = r; zc = uSnT2.x*sin(g*5.654867)*pow(g, 0.6); s = nl + 2.0*T + g*tl;
-    float Q = 0.0, ck = 1.0; for(int k = 0; k < 14; k++){ float e = 1.6*float(k) + 1.0; Q += ck*pow(max(g, 1e-4), e)/e; ck *= 0.88; }   // rows crowd toward the thin tip
+    float Q = 0.0, ck = 1.0; for(int k = 0; k < 14 + uZero; k++){ float e = 1.6*float(k) + 1.0; Q += ck*pow(max(g, 1e-4), e)/e; ck *= 0.88; }   // rows crowd toward the thin tip
     R = (nl + 2.0*T)/L0 + tl/L0*Q; }
   vec2 d = vec2(dot(p.xy - c, up), p.z - zc); return vec4(s, atan(d.y, d.x), r, R); }
 // a snake's own markings along its body: 1 coral rings, 3 a cobra's pale chevrons, 4 a diamondback's pale-edged diamonds, 5 a tree python's broken
@@ -2413,7 +2427,7 @@ vec2 snPat(float s, float a, float g, float id, float nz){ int m = int(uSnP.x + 
   return o*uSnP.w; }
 // nearest feature point of a jittered 3D cell grid: its offset from p and a hash of its cell
 vec4 felCell(vec3 q){ vec3 c = floor(q), f = fract(q); vec4 best = vec4(9.0); float bd = 9.0;
-  for(int k = -1; k <= 1; k++) for(int j = -1; j <= 1; j++) for(int i = -1; i <= 1; i++){ vec3 o = vec3(float(i), float(j), float(k)); vec3 h = hash33(c + o); vec3 r = o + 0.15 + 0.7*h - f; float d = dot(r, r); if(d < bd){ bd = d; best = vec4(r, hash13(c + o + 17.0)); } }
+  for(int k = -1; k <= 1 + uZero; k++) for(int j = -1; j <= 1 + uZero; j++) for(int i = -1; i <= 1 + uZero; i++){ vec3 o = vec3(float(i), float(j), float(k)); vec3 h = hash33(c + o); vec3 r = o + 0.15 + 0.7*h - f; float d = dot(r, r); if(d < bd){ bd = d; best = vec4(r, hash13(c + o + 17.0)); } }
   return best; }
 // tiger stripes in body coordinates: each stripe starts at the spine and runs down the flank, tapering to a point at its own depth;
 // some fork into a pair; legs carry broken bands on their outer side
@@ -2447,7 +2461,7 @@ float felSpots(vec3 p, vec3 rn, float H, float kind, float isLeg, float isHead, 
   vec3 t1 = normalize(cross(rn, abs(rn.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0))), t2 = cross(rn, t1); vec2 q = vec2(dot(o, t1), dot(o, t2));
   bool jag = kind > 3.5 && kind < 4.5, snow = kind > 4.5;
   float rr = (jag ? 0.3 : 0.27) + 0.07*(c.w - 0.5), nb = jag ? 7.0 : snow ? 5.0 : 5.0 + floor(c.w*2.0), m = 0.0;
-  for(int i = 0; i < 7; i++){ float fi = float(i); if(fi >= nb) break;   // a ring of irregular blotches, some missing, leaving the rosette open
+  for(int i = 0; i < 7 + uZero; i++){ float fi = float(i); if(fi >= nb) break;   // a ring of irregular blotches, some missing, leaving the rosette open
     vec3 h = hash33(vec3(c.w*91.0, fi, seed)); if(h.z < (jag ? 0.08 : 0.2)) continue;
     float a = (fi + (h.x - 0.5)*0.55)/nb*6.2832 + c.w*6.2832; vec2 cc = vec2(cos(a), sin(a))*rr*(0.88 + 0.24*h.y);
     vec2 dq = q - cc; float ang2 = a + 1.5708; vec2 dl = vec2(dot(dq, vec2(cos(ang2), sin(ang2))), dot(dq, vec2(-sin(ang2), cos(ang2))));   // stretched along the ring
@@ -2818,7 +2832,7 @@ vec3 exotic(vec3 p, vec3 base, inout vec3 emit, inout float rough, inout float m
     float a1 = step(0.5, fract(p.x*sc*4.0)), a2 = step(0.5, fract(p.y*sc*4.0)); float fine = step(0.85, fract(p.x*sc*16.0)) + step(0.85, fract(p.y*sc*16.0));
     c = mix(uExoA, uExoB, (a1 + a2)*0.5); c = mix(c, uExoC, clamp(fine, 0.0, 1.0)*0.6); c *= 0.9 + 0.1*vnoise(p*300.0);
   } else if(e == 42){ // paint splatter
-    c = base; for(int k=0;k<3;k++){ float fk = float(k); float id; vec3 v = voro(sp*sc*(2.0 + fk*1.3) + fk*7.0, id); float sh = v.x + (fbm(sp*8.0 + fk)-0.5)*0.25; float m = smoothstep(0.32, 0.28, sh)*step(0.55, id);
+    c = base; for(int k=0;k<3 + uZero;k++){ float fk = float(k); float id; vec3 v = voro(sp*sc*(2.0 + fk*1.3) + fk*7.0, id); float sh = v.x + (fbm(sp*8.0 + fk)-0.5)*0.25; float m = smoothstep(0.32, 0.28, sh)*step(0.55, id);
       vec3 pc = k == 0 ? uExoA : k == 1 ? uExoB : uExoC; c = mix(c, pc, m); }
     rough = 0.4;
   } else if(e == 43){ // woodgrain
@@ -3742,7 +3756,7 @@ void main(){
       if(uJel.x > 3.5){ float cr = smoothstep(uJel.z + 0.3, uJel.z + 0.5, p.y); col = mix(uSkC0, uSkC1, cr); col = mix(col, vec3(0.95, 0.5, 0.75), smoothstep(uJel.z + 0.5, uJel.z + 0.62, p.y)*0.7); }   // a man o' war's float: blue below, violet up the crest, pink along its rim
       else if(uJel.x > 2.5){ float lobe = smoothstep(0.2, 0.9, cos(a*8.0))*smoothstep(0.15, 0.7, r); col = mix(uSkC0, uSkC1, 0.5 + 0.5*lobe); col = mix(col, uSkC0*0.6, smoothstep(0.12, 0.0, r)); }   // a lion's mane: russet and gold in eight lobes
       else if(uJel.x < 1.5){ float st = smoothstep(0.55, 0.9, cos(a*16.0))*smoothstep(0.25, 0.85, r)*step(uJel.z, p.y); col = mix(col, col*vec3(0.55, 0.3, 0.25) + vec3(0.12, 0.03, 0.02), st*0.8); }
-      else { float hs = 0.0; for(int k = 0; k < 4; k++){ float ak = float(k)*1.5708 + 0.785; vec2 c = vec2(cos(ak), sin(ak))*0.3*uJel.y; float d = length(p.xz - c); hs = max(hs, smoothstep(0.035*uJel.y, 0.0, abs(d - 0.12*uJel.y))*smoothstep(-0.2, 0.4, dot(normalize(p.xz - c + 1e-4), -normalize(c)) + 0.6)); }
+      else { float hs = 0.0; for(int k = 0; k < 4 + uZero; k++){ float ak = float(k)*1.5708 + 0.785; vec2 c = vec2(cos(ak), sin(ak))*0.3*uJel.y; float d = length(p.xz - c); hs = max(hs, smoothstep(0.035*uJel.y, 0.0, abs(d - 0.12*uJel.y))*smoothstep(-0.2, 0.4, dot(normalize(p.xz - c + 1e-4), -normalize(c)) + 0.6)); }
         col = mix(col, vec3(0.85, 0.55, 0.75), hs*0.85*step(uJel.z, p.y)); } }
     // sea creatures (05x sharks, whales and fish; 05zh rays): colour laid out along the body (uMar .y snout x, .z tail x, .w H): a ragged
     // countershading line, each kind's own markings, the gill slits drawn per pixel, a shark's dark fin tips, a fish's scales and rayed fins
@@ -3800,7 +3814,7 @@ void main(){
       if(uMar3.y > 0.5) col = mix(col, top*0.22, fflat*smoothstep(0.68, 0.93, vUV.y)*(rn.y < 0.0 ? 0.95 : 0.35));   // a great white's black pectoral tips, seen from below
       if(uMar2.y > 0.01 && fin < 0.5){   // a shark's five gill slits: dark grooves with the next flap's rim lit behind each, the hindmost the shortest
         float side = smoothstep(0.2, 0.45, abs(rn.z)), w = max(0.0045*Hm, length(fwidth(p))*0.9), g = 0.0, rim = 0.0;
-        for(int i = 0; i < 5; i++){ float fi = float(i)/4.0, gx = mix(uMar2.z, uMar2.y, fi), ext = mix(0.5, 0.36, fi);
+        for(int i = 0; i < 5 + uZero; i++){ float fi = float(i)/4.0, gx = mix(uMar2.z, uMar2.y, fi), ext = mix(0.5, 0.36, fi);
           float d = (xn - gx)*Lb + 0.012*Hm*rn.y*rn.y, m = smoothstep(ext + 0.06, ext - 0.04, abs(rn.y + 0.12));
           g = max(g, smoothstep(w, w*0.25, abs(d))*m); rim = max(rim, smoothstep(w*2.6, w*0.8, abs(d + w*1.8))*m); }
         g *= side; rim *= side; col *= (1.0 - 0.62*g)*(1.0 + 0.1*rim); nN = bumpN(nN, P, (rim*0.6 - g)*0.0035*Hm, 1.0); }
@@ -3991,7 +4005,7 @@ void main(){
       float gl = clamp(uCare.y, 0.0, 1.0)*clamp(bare, 0.0, 1.0)*(1.0 - isHoof); s.rough = mix(s.rough, max(0.34, s.rough - 0.16), gl);
       float face = isHead*smoothstep(0.5, 0.9, vReg.w), gr = clamp(uCare.z, 0.0, 1.0)*face*smoothstep(0.4, 0.7, fbm(p*34.0 + uSeed)); s.albedo = mix(s.albedo, vec3(0.42, 0.4, 0.38), gr*0.75);
       float cv = clamp(vColor.g - vColor.b, -1.0, 1.0); s.albedo *= 1.0 + cv*0.12*clamp(uCare.w, 0.0, 1.0)*clamp(bare, 0.0, 1.0); }
-    for(int i = 0; i < 4; i++){ vec4 sc = uScar[i]; if(abs(sc.z) < 0.5) continue;   // healed scars: a thin pale hairless line, a little raised, on one side
+    for(int i = 0; i < 4 + uZero; i++){ vec4 sc = uScar[i]; if(abs(sc.z) < 0.5) continue;   // healed scars: a thin pale hairless line, a little raised, on one side
       float side = step(0.0, p.z*sc.z); if(side < 0.5) continue;
       vec2 c = vec2(mix(uDims.x, uDims.y, sc.x), mix(uDims.w, uDims.z, sc.y)); vec2 d = vec2(cos(sc.w), sin(sc.w)); vec2 q = p.xy - c;
       float t = clamp(dot(q, d), -0.09, 0.09), w = 0.009*(1.0 - pow(abs(t)/0.09, 2.0)) + 0.002; float dd = length(q - d*t) + (vnoise(p*90.0) - 0.5)*0.003;
@@ -20668,7 +20682,7 @@ const Portraits = {
   get(h) { const k = this.key(h); if (this.urls.has(k)) return this.urls.get(k); if (!this.queue.find(q => q.k === k)) this.queue.push({ k, h }); return null; },
   getGenome(g) { const k = 'g' + g.seed; if (this.urls.has(k)) return this.urls.get(k); if (!this.queue.find(q => q.k === k)) this.queue.push({ k, g }); return null; },
   async pump() {
-    if (this.busy || !this.queue.length) return; this.busy = true;
+    if (this.busy || !this.queue.length || (this._wait && performance.now() < this._wait)) return; this.busy = true;
     const job = this.queue.shift();
     try {
       const m = job.h ? await HorseCache.get(job.h) : await HorseCache.getGenome(job.g);
@@ -20687,6 +20701,7 @@ const Portraits = {
       const d = Math.max(hgt * 1.15, len * 0.84) * 2.38;
       cam.pos = [cx + d * 0.5, hgt * 0.5 + d * 0.06, d * 0.86]; cam.target = [cx + len * 0.04, hgt * 0.46, 0];   // a three-quarter view from in front, a little low: the face reads and the animal stands tall
       S.shadow.center = [cx, 0.6 * sc, 0]; S.shadow.radius = Math.max(hgt, len) * 0.75;
+      if (E.lazy && !E.sceneReady(S)) { this.queue.unshift(job); this.busy = false; this._wait = performance.now() + 600; return; }   // its shaders are still compiling: try again shortly
       E.time += 0.01;
       const T = E.render(S, cam, { w: this.W, h: this.H, key: 'thumb', toLDR: true });
       const px = E.readPixels(T);
@@ -22362,14 +22377,14 @@ const App = {
     this.ranch = new RanchView(); this.studio = new StudioView(); this.race = new RaceView();
     const gfx = (t, a, b) => (d, n) => msg(t + ' · ' + Math.round(100 * d / Math.max(1, n)) + '%', a + (b - a) * d / Math.max(1, n));
     msg('Preparing the graphics', 0.1); await new Promise(r => setTimeout(r, 30));
-    try { await E.warm(E.sceneKeys(this.ranch.S).concat(E.postKeys()), gfx('Preparing the graphics', 0.1, 0.3)); } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
+    try { await E.warm(E.sceneKeys(this.ranch.S).concat(E.postKeys()), gfx('Preparing the graphics', 0.1, 0.3), 40000); } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
     msg('Breeding the herd', 0.3);
     UI.init(); Viewer.init(); DevConsole.lines = [];
     this.ranch.sync();
     const t0 = performance.now();
     await new Promise(res => { const chk = () => { const total = this.ranch.rigs.size; const have = [...this.ranch.rigs.values()].filter(e => e.rig).length; msg('Breeding the herd · ' + have + ' of ' + total, 0.3 + 0.65 * (total ? have / total : 1)); if (have >= total || performance.now() - t0 > 20000) res(); else setTimeout(chk, 120); }; chk(); });
     try { this.ranch.update(0.016); } catch (e) { }   // brings the yard to life (stable hands, birds, staff) so their shaders are ready before the first frame too
-    try { await E.warm(E.sceneKeys(this.ranch.S), gfx('Saddling the herd', 0.95, 1)); } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
+    try { await E.warm(E.sceneKeys(this.ranch.S), gfx('Saddling the herd', 0.95, 1), 15000); E.lazy = true; } catch (e) { msg('Shader error: ' + e.message); console.error(e); return; }
     this.bindInput();
     this.last = performance.now(); requestAnimationFrame(t => this.frame(t));
     msg('Ready', 1);
