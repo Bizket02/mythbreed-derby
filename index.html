@@ -27437,7 +27437,13 @@ const SaveCode = {
     if (!ok && t) { try { t.focus(); t.select(); ok = document.execCommand('copy'); } catch (e) { } }
     UI.toast(ok ? 'Save code copied.' : 'Select the code and copy it by hand.', ok ? 'good' : '');
   },
-  download() {
+  async download() {
+    let dl = null; try { dl = typeof window.claude === 'object' && typeof window.claude.use === 'function' ? await window.claude.use('downloads') : null; } catch (e) { dl = null; }
+    if (dl) {   // inside Claude the page can't download directly: the viewer confirms the file
+      try { await dl.save({ filename: this.file(), data: this._code }); UI.toast('Save file saved.', 'good'); }
+      catch (e) { if (!e || e.code !== 'declined') UI.toast(e && e.code === 'rate_limited' ? 'One moment, then try again.' : 'Saving a file isn\'t available here. Copy the code instead.', ''); }
+      return;
+    }
     try { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([this._code], { type: 'text/plain' })); a.download = this.file(); document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); UI.toast('Save file downloaded.', 'good'); }
     catch (e) { UI.toast('Downloads are blocked here. Copy the code instead.', ''); }
   },

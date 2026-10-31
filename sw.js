@@ -1,6 +1,6 @@
 // Mythbreed Derby offline support. The page opens from the cache straight away (and works with no signal);
 // a fresh copy is fetched in the background and used the next time the app opens.
-const CACHE = 'mbd-1f41c90b06', FONTS = 'mbd-fonts';
+const CACHE = 'mbd-fec1de1adc', FONTS = 'mbd-fonts';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE && k !== FONTS).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
