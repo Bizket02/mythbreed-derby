@@ -2288,6 +2288,9 @@ void statueSurf(inout Surf s, vec3 p, float cav){
 }
 `;
 const FS_HORSE = FS_HEAD + GLSL_NOISE + GLSL_LIGHT + GLSL_STATUE + `
+#ifdef ARTMAP
+uniform sampler2D uArtAlb, uArtNrm; uniform vec4 uArt0;   // artist-made models (55_artist.js): their painted texture and normal map; [normal strength, painted-detail strength, texture mean brightness, 1 = the artist's own colours]
+#endif
 uniform int uZero;   // always 0: hides the loop counts from the compiler so Windows (D3D) keeps real loops instead of unrolling them, which made this shader take minutes to compile there
 uniform vec3 uBase, uPoints, uMuzzle, uHoof, uEye, uExoA, uExoB, uExoC, uGlowCol, uChimeraCol, uHornCol, uMane;
 uniform float uPointsAmt, uPangare, uSooty, uDun, uDapple, uGrey, uRoan, uEyeGlow, uGlow, uChimera, uGhost, uSeed, uExo, uHornGlow, uFlaxen, uSkinPink, uAge;
@@ -2865,7 +2868,11 @@ vec3 exotic(vec3 p, vec3 base, inout vec3 emit, inout float rough, inout float m
 }
 
 #ifdef DEPTH
-void main(){ outColor = vec4(1.0); }
+void main(){
+#ifdef ARTMAP
+  if(vColor.y > 1.5 && vColor.y < 2.5 && texture(uArtAlb, vColor.zw).a < 0.5) discard;   // an artist model's mane and tail cards cast their strands, not their quads
+#endif
+  outColor = vec4(1.0); }
 #else
 void main(){
   bool ff = uMirror > 0.5 ? !gl_FrontFacing : gl_FrontFacing;
@@ -4042,6 +4049,24 @@ void main(){
       if(uHoofMat > 2.5){ float id; vec3 v = voro(p*30.0, id); s.albedo = mix(s.albedo, vec3(0.42, 0.4, 0.38)*(0.6 + 0.5*id)*(1.0 - 0.6*(1.0 - smoothstep(0.0, 0.05, v.z))), isHoof); s.rough = mix(s.rough, 0.9, isHoof); }
     }
   }
+  float artA = 1.0;
+#ifdef ARTMAP
+  {   // an artist-made model: its normal map, and its painted hair, muscle and vein detail under the genetic coat
+    vec2 au = vColor.zw; vec4 ta4 = texture(uArtAlb, au); vec3 ta = ta4.rgb*ta4.rgb;
+    vec3 tn = texture(uArtNrm, au).xyz*2.0 - 1.0;
+    vec3 dp1 = dFdx(P), dp2 = dFdy(P); vec2 du1 = dFdx(au), du2 = dFdy(au);
+    vec3 dp2p = cross(dp2, s.N), dp1p = cross(s.N, dp1);
+    vec3 Ta = dp2p*du1.x + dp1p*du2.x, Ba = dp2p*du1.y + dp1p*du2.y;
+    float im = inversesqrt(max(max(dot(Ta, Ta), dot(Ba, Ba)), 1e-20));
+    vec3 nm = normalize(Ta*im*tn.x - Ba*im*tn.y + s.N*max(tn.z, 0.05));   // glTF normal maps: +y up in the image, and v runs down it
+    s.N = normalize(mix(s.N, nm, uArt0.x));
+    vec3 tb = textureLod(uArtAlb, au, 4.5).rgb; tb *= tb;   // the painting blurred: its large patches (a painted pinto) are not ours to copy, only the fine hair, muscle and vein detail is
+    float lum = dot(ta, vec3(0.3, 0.59, 0.11)), det = clamp(lum/max(dot(tb, vec3(0.3, 0.59, 0.11)), 0.02), 0.55, 1.6);
+    if(vColor.y > 1.5 && vColor.y < 2.5){ artA = ta4.a; if(artA < (uA2C > 0.5 ? 0.1 : 0.5)) discard; s.albedo = uArt0.w > 0.5 ? ta : uMane*mix(1.0, det, uArt0.y); s.sheen = 0.0; s.rough = 0.82; s.clear = 0.0; s.spec = 0.25; s.aniso = 0.0; s.rimK = 0.3; gCoat = 0.0; }   // mane and tail: the genetic mane colour through the artist's strands
+    else if(uArt0.w > 0.5) s.albedo = ta;   // the artist's own colours (for comparison)
+    else s.albedo *= mix(1.0, det, uArt0.y*(1.0 - 0.5*smoothstep(0.35, 0.75, vExtra.z)));
+  }
+#endif
   vec3 V = normalize(uCamPos - P);
   float NdV = max(dot(s.N, V), 0.0);
   if(uFinish.x > 3.5 && uFinish.x < 4.5 && region < 3.5 && vExtra.z < 0.5){ // iridescent
@@ -4086,6 +4111,9 @@ void main(){
       else col += uSunCol*an*tint*shadowAt(P, s.N); }
   }
   float alpha = 1.0;
+#ifdef ARTMAP
+  alpha = artA;
+#endif
   if(uGhost > 0.01 && region < 3.5){
     float rim = pow(1.0 - NdV, 2.0);
     col = col*0.6 + uGlowCol*rim*2.5; alpha = mix(1.0, 0.25 + 0.7*rim, uGhost);
@@ -6502,6 +6530,7 @@ class HorseModel {
     buildLoco(body, hair, vis, L, rng, spec);
     if (L.multiHead) { multiHeadParts(body, out.pos.length / 3, L); multiHeadParts(hair, 0, L); }
     m.body = E.createMesh(body.toMeshDef());
+    if (vis.keepGeo) m.geo = body;   // an artist model borrows the body coordinates (55_artist.js)
     m.hair = hair.vcount ? E.createMesh(hair.toMeshDef()) : null;
     m.wings = !!(vis.wings && vis.wings.type); m.wingMorph = !!L.wingMorph;
     const bb = body.bounds(), hb = hair.vcount ? hair.bounds() : bb;
@@ -24230,10 +24259,10 @@ RaceView.prototype.update = function (dt) {
   if (this.kind && this.kind !== 'flat' && this.started) for (const r of this.runners) {
     if (r.fin) continue; const ob = this.obs[r.nextOb]; if (!ob) continue; const ahead = ob.s - r.s;
     if (this.kind === 'sky') { if (ahead < 0) r.nextOb++; continue; }
-    if (ahead < 3.2 * r.sc && r.jumpT < 0) {   // take off: a clean leap or a blunder
+    if (ahead < Math.max(3.2 * r.sc, r.v * clamp(0.55 + 0.25 * r.sc, 0.5, 1.1) * 0.5) && r.jumpT < 0) {   // take off half a leap before the fence, so the top of the arc is over it: a clean leap or a blunder
       const kit = r._kit, skill = kit.leap * (0.75 + 0.25 * r.st.agi / 100) * (ob.type === 'water' && kit.swims ? 1.3 : 1);
-      const clean = Math.random() < 0.55 + 0.45 * skill; r.jumpT = 0; r.jumpDur = clamp(0.55 + 0.25 * r.sc, 0.5, 1.1); r.jumpH = (ob.type === 'ditch' ? 0.6 : ob.type === 'log' ? 0.9 : 1.3) * Math.max(0.6, r.sc) * (kit.flies ? 1.3 : 1);
-      if (!clean) { r.v *= 0.55; r.en -= 0.04; r.jumpH *= 0.5; if (r.isPlayer) UI.ticker(`${r.name} gets in close and blunders over the ${ob.type === 'water' ? 'water jump' : ob.type}!`); }
+      const clean = Math.random() < 0.55 + 0.45 * skill; r.jumpT = 0; r.jumpDur = clamp(0.55 + 0.25 * r.sc, 0.5, 1.1); r.jumpH = (ob.type === 'ditch' ? 0.55 : ob.type === 'log' ? 1.05 : 1.45) * (kit.flies ? 1.2 : 1) * clamp(0.85 + 0.15 * r.sc, 0.9, 1.25);   // high enough for the hooves to clear the top whatever the animal's size
+      if (!clean) { r.v *= 0.55; r.en -= 0.04; r.jumpH *= 0.88; if (r.isPlayer) UI.ticker(`${r.name} gets in close and blunders over the ${ob.type === 'water' ? 'water jump' : ob.type}!`); }
       else if (r.isPlayer && Math.random() < 0.5) UI.ticker(`${r.name} soars over the ${ob.type === 'water' ? 'water jump' : ob.type === 'ditch' ? 'ditch' : 'fence'}.`);
       if (ob.type === 'water' && this.S.fx) for (let k = 0; k < 30; k++) { const p = r.rig.pos; this.S.fx.emit({ p: [p[0] + (Math.random() - 0.5), 0.2, p[2] + (Math.random() - 0.5)], v: [(Math.random() - 0.5) * 3, 2 + Math.random() * 2, (Math.random() - 0.5) * 3], c: [1.2, 1.3, 1.4, 0.6], size: 0.06, type: 0, life: 0.9, g: 6, drag: 0.5 }); }
       r.nextOb++;
@@ -27854,6 +27883,444 @@ DevConsole.cmds.staff = function (a) {
 };
 DEV_NEW_HELP.push('staff [open|hire <role|all> [1-3]|fire <role|all>|work|pay]   hired help: list, hire (1 apprentice … 3 master), let go, run a morning now, clear unpaid days');
 DEV_TOOLS.push({ id: 'staff', cat: 'content', title: 'Staff', desc: 'Grooms, trainers, vets and head lads who look after the stable each morning.', kw: 'staff workers hire groom trainer vet head lad wages employees helpers automatic care training', ui: 'btns', btns: [['Open staff', 'staff open'], ['Hire master team', 'staff hire all 3', 1], ['Run a morning', 'staff work'], ['Let everyone go', 'staff fire all']] });
+
+/* ============================================================
+   ARTIST MODELS — rigged, animated creatures made by 3D artists
+   (CC licensed, credited in Settings → Credits), loaded from the
+   game's compact .mbm files (tools/glb2mbm.py) and drawn with the
+   same creature shader as the code-built animals, so breeding still
+   decides the coat: the genetic colours, patterns and markings are
+   carried onto the artist's mesh, and the artist's own painted hair,
+   muscle and vein detail and normal map sit underneath.
+   Animation is the artist's: walk, gallop, jump, swim, eat, sleep.
+   ============================================================ */
+const MBM = {
+  cache: new Map(),
+  url(name) { return 'assets/' + name + '.mbm'; },
+  load(name) {
+    if (!this.cache.has(name)) this.cache.set(name, (async () => {
+      const get = (url, type) => new Promise((res, rej) => {   // (XHR rather than fetch: it also reads the files when the game is opened from disk)
+        const x = new XMLHttpRequest(); x.open('GET', url); x.responseType = type;
+        x.onload = () => (x.status === 200 || x.status === 0) && x.response && (x.response.byteLength || x.response.length) ? res(x.response) : rej(new Error('could not load ' + name));
+        x.onerror = () => rej(new Error('could not load ' + name)); x.send(); });
+      let buf = window.__MBM && window.__MBM[name];
+      if (!buf) try { buf = await get(this.url(name), 'arraybuffer'); if (new DataView(buf).getUint32(0, true) !== 0x314d424d) throw 0; }
+      catch (e) {   // where only text files can be served, the same model comes as base64
+        const t = await get(this.url(name) + '.txt', 'text'), bin = atob(t.trim()), u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); buf = u.buffer; }
+      return this.parse(buf);
+    })());
+    return this.cache.get(name);
+  },
+  async parse(buf) {
+    const dv = new DataView(buf); if (dv.getUint32(0, true) !== 0x314d424d) throw new Error('not an .mbm model');
+    const hl = dv.getUint32(4, true), H = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl))), base = 8 + hl;
+    const TA = { '<f4': Float32Array, '<i2': Int16Array, '|u1': Uint8Array, '<u2': Uint16Array, '<u4': Uint32Array };
+    const arr = k => { const a = H.arrays[k]; return new TA[a.t](buf, base + a.off, a.n); };
+    const tex = async (t, normal) => {
+      if (!t) return null;
+      const bm = await createImageBitmap(new Blob([arr(t.key)], { type: t.fmt === 'png' ? 'image/png' : 'image/jpeg' }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+      const tx = E.texFromCanvas(bm, { repeat: false });
+      if (!normal) {   // the painted texture's average brightness (where it isn't see-through), so its detail can sit around the genetic colour without darkening or lightening it
+        try { const cv = document.createElement('canvas'); cv.width = cv.height = 48; const x = cv.getContext('2d'); x.drawImage(bm, 0, 0, 48, 48); const d = x.getImageData(0, 0, 48, 48).data; let sum = 0, n = 0;
+          for (let i = 0; i < d.length; i += 4) { if (d[i + 3] < 128) continue; const r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255; sum += 0.3 * r * r + 0.59 * g * g + 0.11 * b * b; n++; }
+          tx._lum = n ? sum / n : 0.4; } catch (e) { tx._lum = 0.4; }
+      }
+      return tx;
+    };
+    const def = { H, nodes: H.nodes, joints: H.joints, fps: H.fps, ibm: arr('ibm'), parts: [], clips: {} };
+    for (let k = 0; k < H.parts.length; k++) {
+      const p = H.parts[k];
+      def.parts.push({ name: p.name, pos: arr(`p${k}pos`), nrm: arr(`p${k}nrm`), uv: arr(`p${k}uv`), j: arr(`p${k}j`), w: arr(`p${k}w`), idx: arr(`p${k}i`), color: p.color, rough: p.rough,
+        base: await tex(p.base), normal: await tex(p.normal, true), alpha: !!(p.base && p.base.alpha) });
+    }
+    for (const [nm, c] of Object.entries(H.clips)) def.clips[nm] = { dur: c.dur, frames: c.frames, tracks: c.tracks.map(t => ({ node: t.node, path: t.path, c: t.const || null, v: t.key ? arr(t.key) : null })) };
+    // rest pose: every node's world matrix with no animation
+    def.rest = def.nodes.map(n => ({ t: n.t.slice(), r: n.r.slice(), s: n.s.slice() }));
+    def.restG = artGlobals(def, def.rest);
+    return def;
+  },
+};
+function artTRS(t, r, s, o) {   // column-major TRS matrix
+  const [x, y, z, w] = r, x2 = x + x, y2 = y + y, z2 = z + z, xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2, wx = w * x2, wy = w * y2, wz = w * z2;
+  o[0] = (1 - (yy + zz)) * s[0]; o[1] = (xy + wz) * s[0]; o[2] = (xz - wy) * s[0]; o[3] = 0;
+  o[4] = (xy - wz) * s[1]; o[5] = (1 - (xx + zz)) * s[1]; o[6] = (yz + wx) * s[1]; o[7] = 0;
+  o[8] = (xz + wy) * s[2]; o[9] = (yz - wx) * s[2]; o[10] = (1 - (xx + yy)) * s[2]; o[11] = 0;
+  o[12] = t[0]; o[13] = t[1]; o[14] = t[2]; o[15] = 1; return o;
+}
+function artGlobals(def, pose, out) {
+  out = out || def.nodes.map(() => new Float32Array(16)); const L = artGlobals._l || (artGlobals._l = new Float32Array(16));
+  def.nodes.forEach((n, i) => { const P = pose[i]; artTRS(P.t, P.r, P.s, L); if (n.parent >= 0) m4.mul(out[n.parent], L, out[i]); else out[i].set(L); });
+  return out;
+}
+function m4inv(m) {   // general 4x4 inverse
+  const o = new Float32Array(16), a = m;
+  const b00 = a[0] * a[5] - a[1] * a[4], b01 = a[0] * a[6] - a[2] * a[4], b02 = a[0] * a[7] - a[3] * a[4], b03 = a[1] * a[6] - a[2] * a[5], b04 = a[1] * a[7] - a[3] * a[5], b05 = a[2] * a[7] - a[3] * a[6];
+  const b06 = a[8] * a[13] - a[9] * a[12], b07 = a[8] * a[14] - a[10] * a[12], b08 = a[8] * a[15] - a[11] * a[12], b09 = a[9] * a[14] - a[10] * a[13], b10 = a[9] * a[15] - a[11] * a[13], b11 = a[10] * a[15] - a[11] * a[14];
+  const d = 1 / (b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06);
+  o[0] = (a[5] * b11 - a[6] * b10 + a[7] * b09) * d; o[1] = (a[2] * b10 - a[1] * b11 - a[3] * b09) * d; o[2] = (a[13] * b05 - a[14] * b04 + a[15] * b03) * d; o[3] = (a[10] * b04 - a[9] * b05 - a[11] * b03) * d;
+  o[4] = (a[6] * b08 - a[4] * b11 - a[7] * b07) * d; o[5] = (a[0] * b11 - a[2] * b08 + a[3] * b07) * d; o[6] = (a[14] * b02 - a[12] * b05 - a[15] * b01) * d; o[7] = (a[8] * b05 - a[10] * b02 + a[11] * b01) * d;
+  o[8] = (a[4] * b10 - a[5] * b08 + a[7] * b06) * d; o[9] = (a[1] * b08 - a[0] * b10 - a[3] * b06) * d; o[10] = (a[12] * b04 - a[13] * b02 + a[15] * b00) * d; o[11] = (a[9] * b02 - a[8] * b04 - a[11] * b00) * d;
+  o[12] = (a[5] * b07 - a[4] * b09 - a[6] * b06) * d; o[13] = (a[0] * b09 - a[1] * b07 + a[2] * b06) * d; o[14] = (a[13] * b01 - a[12] * b03 - a[14] * b00) * d; o[15] = (a[8] * b03 - a[9] * b01 + a[10] * b00) * d;
+  return o;
+}
+const xf = (M, p) => [M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12], M[1] * p[0] + M[5] * p[1] + M[9] * p[2] + M[13], M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14]];
+const xfN = (M, n) => { const v = [M[0] * n[0] + M[4] * n[1] + M[8] * n[2], M[1] * n[0] + M[5] * n[1] + M[9] * n[2], M[2] * n[0] + M[6] * n[1] + M[10] * n[2]]; const l = Math.hypot(...v) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+
+// ---------------- a creature built on an artist model ----------------
+// The rest pose is moved into the code-built animal's frame (head along +x, feet on y = 0, the same size), so the creature
+// shader's body coordinates line up; every vertex then borrows the region, body coordinates and occlusion of the nearest
+// point on the code-built animal of the same genome. Bones: B = A · G · Grest⁻¹ · A⁻¹.
+const ArtistModel = {
+  async build(name, vis, opts = {}) {
+    const proc = await HorseModel.create(E, Object.assign({}, vis, { keepGeo: true }), { noArtist: true });
+    const am = await this.fromProc(name, proc, vis, opts);
+    E.deleteMesh && proc.body && E.deleteMesh(proc.body); proc.hair && E.deleteMesh && E.deleteMesh(proc.hair);
+    return am;
+  },
+  async fromProc(name, proc, vis, opts = {}) {
+    const def = await MBM.load(name);
+    const G0 = def.restG, J = def.joints;
+    const skin0 = J.map((n, k) => m4.mul(G0[n], def.ibm.subarray(k * 16, k * 16 + 16), new Float32Array(16)));
+    // rest-pose world positions of every part
+    const parts = def.parts.map(p => {
+      const nv = p.pos.length / 3, w = new Float32Array(nv * 3), nn = new Float32Array(nv * 3);
+      for (let i = 0; i < nv; i++) {
+        let a = [0, 0, 0], b = [0, 0, 0]; const v = [p.pos[i * 3], p.pos[i * 3 + 1], p.pos[i * 3 + 2]], n = [p.nrm[i * 3], p.nrm[i * 3 + 1], p.nrm[i * 3 + 2]];
+        for (let k = 0; k < 4; k++) { const wt = p.w[i * 4 + k] / 255; if (!wt) continue; const M = skin0[p.j[i * 4 + k]]; const q = xf(M, v), r = xfN(M, n); for (let c = 0; c < 3; c++) { a[c] += q[c] * wt; b[c] += r[c] * wt; } }
+        w.set(a, i * 3); const l = Math.hypot(...b) || 1; nn.set([b[0] / l, b[1] / l, b[2] / l], i * 3);
+      }
+      return { p, nv, w, nn };
+    });
+    // alignment: which way is forward (toward the head joint), how big, where the feet are
+    const body = parts.find(q => q.p.name === (opts.bodyPart || 'Horse')) || parts[0];
+    let mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+    for (let i = 0; i < body.nv; i++) for (let c = 0; c < 3; c++) { mn[c] = Math.min(mn[c], body.w[i * 3 + c]); mx[c] = Math.max(mx[c], body.w[i * 3 + c]); }
+    const headN = def.nodes.findIndex(n => /head/i.test(n.name)), rootN = J[0];
+    const hp = xf(G0[headN >= 0 ? headN : J[J.length - 1]], [0, 0, 0]), cen = [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2];
+    const fwd = Math.atan2(hp[2] - cen[2], hp[0] - cen[0]);   // rotate this direction onto +x
+    const pb = proc.geo.bounds();
+    const c = Math.cos(fwd), s = Math.sin(fwd);
+    const R = new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);   // a turn about y that brings the head direction onto +x
+    const A1 = m4.mul(R, m4.translation([-cen[0], -mn[1], -cen[2]]));
+    // size by the height of the back over the middle of the body (the head may be held high or low, the back is not)
+    const backTop = (P, n, lo, hi) => { let x0 = 1e9, x1 = -1e9; for (let i = 0; i < n; i++) { x0 = Math.min(x0, P(i)[0]); x1 = Math.max(x1, P(i)[0]); } let top = -1e9, y0 = 1e9;
+      for (let i = 0; i < n; i++) { const q = P(i); y0 = Math.min(y0, q[1]); if (q[0] > x0 + (x1 - x0) * lo && q[0] < x0 + (x1 - x0) * hi) top = Math.max(top, q[1]); } return { top: top - y0, mid: x0 + (x1 - x0) * (lo + hi) / 2, y0 }; };
+    const aB = backTop(i => xf(A1, [body.w[i * 3], body.w[i * 3 + 1], body.w[i * 3 + 2]]), body.nv, 0.36, 0.56);
+    const gpos = proc.geo.pos, gn = gpos.length / 3, gb = [];
+    for (let i = 0; i < gn; i++) if (proc.geo.reg[i * 4] < 3.5) gb.push(i);
+    const pB = backTop(k => [gpos[gb[k] * 3], gpos[gb[k] * 3 + 1], gpos[gb[k] * 3 + 2]], gb.length, 0.36, 0.56);
+    const sc = (opts.scale || 1) * pB.top / aB.top;
+    const A0 = m4.mul(m4.fromTRS([0, 0, 0], [0, 0, 0, 1], [sc, sc, sc]), A1);
+    let amn = [1e9, 1e9, 1e9], amx = [-1e9, -1e9, -1e9];
+    for (let i = 0; i < body.nv; i++) { const q = xf(A0, [body.w[i * 3], body.w[i * 3 + 1], body.w[i * 3 + 2]]); for (let k = 0; k < 3; k++) { amn[k] = Math.min(amn[k], q[k]); amx[k] = Math.max(amx[k], q[k]); } }
+    const shift = [pB.mid - aB.mid * sc, -amn[1], -(amn[2] + amx[2]) / 2];   // the middles of the backs line up, the feet stand on y = 0
+    const A = m4.mul(m4.translation(shift), A0), Ai = m4inv(A);
+    // nearest point on the code-built animal (for the transfer the artist mesh is stretched to the same extents)
+    const g = proc.geo, gp = g.pos, gv = gp.length / 3, cell = 0.06, grid = new Map(), key = (x, y, z) => ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) | 0;
+    for (let i = 0; i < gv; i++) { if (g.reg[i * 4] > 3.5 && g.reg[i * 4] !== 9) continue; const k = key(Math.floor(gp[i * 3] / cell), Math.floor(gp[i * 3 + 1] / cell), Math.floor(gp[i * 3 + 2] / cell)); let b = grid.get(k); if (!b) grid.set(k, b = []); b.push(i); }
+    const stretch = [1, 1, (pb.mx[2] - pb.mn[2]) / (amx[2] - amn[2])];
+    const nearest = q => {
+      const x = (q[0] - (pb.mn[0] + pb.mx[0]) / 2) * stretch[0] + (pb.mn[0] + pb.mx[0]) / 2, y = q[1], z = q[2] * stretch[2];
+      const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell); let best = -1, bd = 1e9;
+      for (let r = 1; r <= 4 && best < 0; r++) for (let i = -r; i <= r; i++) for (let j = -r; j <= r; j++) for (let k = -r; k <= r; k++) {
+        const b = grid.get(key(cx + i, cy + j, cz + k)); if (!b) continue;
+        for (const v of b) { const d = (gp[v * 3] - x) ** 2 + (gp[v * 3 + 1] - y) ** 2 + (gp[v * 3 + 2] - z) ** 2; if (d < bd) { bd = d; best = v; } }
+      }
+      return best < 0 ? 0 : best;
+    };
+    // what each bone is, by its name: head, leg, hoof
+    const jn = J.map(n => def.nodes[n].name);
+    const isHeadJ = jn.map(n => /head|eye|ear|jaw|lip|nose|mouth|tongue|teeth|horn/i.test(n));
+    const isLegJ = jn.map(n => /arm|forearm|hand|finger|toe|thigh|thing|calf|shin|knee|link|foot|leg|hoof|ankle|wrist|cannon|pastern/i.test(n) && !/clavicle|shoulder|pelvis|hip\b/i.test(n));
+    const isToeJ = jn.map(n => /toe|hoof|finger|digit/i.test(n));
+    const hoofH = 0.075 * pB.top / 1.0;
+    // the head is matched in its own frame (it may be carried higher or lower than the code-built one's), so faces keep their blazes, stars and snips
+    const nodeAt = re => def.nodes.findIndex(n => re.test(n.name));
+    const hN = nodeAt(/^BN_Head|head/i), noseNs = def.nodes.map((n, i) => /nose|up_lip|upperlip|muzzle/i.test(n.name) ? i : -1).filter(i => i >= 0);
+    let headMap = null;
+    if (hN >= 0 && noseNs.length && proc.L && proc.L.poll && proc.L.A) {
+      const Ha = xf(A, xf(G0[hN], [0, 0, 0])), nose = noseNs.map(i => xf(A, xf(G0[i], [0, 0, 0]))).reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]]).map(v => v / noseNs.length);
+      const La = Math.hypot(nose[0] - Ha[0], nose[1] - Ha[1]), tip = proc.L.hx(1, 0, 0), poll = proc.L.poll, Lp = Math.hypot(tip[0] - poll[0], tip[1] - poll[1]);
+      const d = Math.atan2(tip[1] - poll[1], tip[0] - poll[0]) - Math.atan2(nose[1] - Ha[1], nose[0] - Ha[0]), cd = Math.cos(d), sd = Math.sin(d), k = Lp / Math.max(La, 1e-4);
+      headMap = q => { const x = q[0] - Ha[0], y = q[1] - Ha[1]; return [poll[0] + (x * cd - y * sd) * k, poll[1] + (x * sd + y * cd) * k, q[2] * k]; };
+    }
+    const hgrid = new Map();
+    for (let i = 0; i < gv; i++) { if (g.ext[i * 4] < 0.5 || (g.reg[i * 4] > 3.5 && g.reg[i * 4] !== 9)) continue; const kk = key(Math.floor(gp[i * 3] / cell), Math.floor(gp[i * 3 + 1] / cell), Math.floor(gp[i * 3 + 2] / cell)); let b = hgrid.get(kk); if (!b) hgrid.set(kk, b = []); b.push(i); }
+    const nearestIn = (G, x, y, z) => { const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell); let best = -1, bd = 1e9;
+      for (let r = 1; r <= 5 && best < 0; r++) for (let i = -r; i <= r; i++) for (let j = -r; j <= r; j++) for (let kz = -r; kz <= r; kz++) { const b = G.get(key(cx + i, cy + j, cz + kz)); if (!b) continue;
+        for (const v of b) { const dd = (gp[v * 3] - x) ** 2 + (gp[v * 3 + 1] - y) ** 2 + (gp[v * 3 + 2] - z) ** 2; if (dd < bd) { bd = dd; best = v; } } }
+      return best; };
+    const meshes = parts.map(({ p, nv, w, nn }) => {
+      const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), reg = new Float32Array(nv * 4), ext = new Float32Array(nv * 4), uv = new Float32Array(nv * 2), col = new Float32Array(nv * 4);
+      const hairPart = p.alpha || /hair|mane|tail/i.test(p.name), eyePart = /cornea|eye/i.test(p.name);
+      for (let i = 0; i < nv; i++) {
+        const q = xf(A, [w[i * 3], w[i * 3 + 1], w[i * 3 + 2]]); pos.set(q, i * 3); nrm.set(xfN(A, [nn[i * 3], nn[i * 3 + 1], nn[i * 3 + 2]]), i * 3);
+        let wh0 = 0; for (let k = 0; k < 4; k++) if (isHeadJ[p.j[i * 4 + k]]) wh0 += p.w[i * 4 + k] / 255;
+        let v = -1; if (headMap && wh0 > 0.35) { const hq = headMap(q); v = nearestIn(hgrid, hq[0], hq[1], hq[2]); }
+        if (v < 0) v = nearest(q);
+        for (let k = 0; k < 4; k++) { reg[i * 4 + k] = g.reg[v * 4 + k]; ext[i * 4 + k] = g.ext[v * 4 + k]; }
+        if (reg[i * 4] > 3.5 && reg[i * 4] !== 9) reg[i * 4] = 0;
+        let wh = 0, wl = 0, wt = 0;   // head, leg and hoof come from the artist's own skeleton, not the nearest point
+        for (let k = 0; k < 4; k++) { const jj = p.j[i * 4 + k], ww = p.w[i * 4 + k] / 255; if (isHeadJ[jj]) wh += ww; if (isLegJ[jj]) wl += ww; if (isToeJ[jj]) wt += ww; }
+        ext[i * 4] = Math.min(1, wh); ext[i * 4 + 1] = Math.min(1, wl); ext[i * 4 + 2] = Math.min(1, wt) * clamp((hoofH + 0.02 - q[1]) / 0.04, 0, 1);
+        uv[i * 2] = g.uv[v * 2]; uv[i * 2 + 1] = g.uv[v * 2 + 1];
+        col[i * 4] = 1; col[i * 4 + 1] = hairPart ? 2 : eyePart ? 3 : 0; col[i * 4 + 2] = p.uv[i * 2]; col[i * 4 + 3] = p.uv[i * 2 + 1];
+      }
+      const mesh = E.createMesh({ attribs: { aPos: { data: pos, size: 3 }, aNormal: { data: nrm, size: 3 }, aUV: { data: uv, size: 2 }, aColor: { data: col, size: 4 }, aSkinIndex: { data: p.j, size: 4 }, aSkinWeight: { data: p.w, size: 4, normalized: true }, aReg: { data: reg, size: 4 }, aExtra: { data: ext, size: 4 } }, index: p.idx });
+      let lum = 0.5;   // the texture's average brightness, so the painted detail lightens and darkens around the genetic colour instead of shifting it
+      return { mesh, part: p, hairPart, eyePart, lum, bounds: null };
+    });
+    return { def, proc, A, Ai, meshes, height: (amx[1] - amn[1]) + 0, length: amx[0] - amn[0], center: [(pb.mn[0] + pb.mx[0]) / 2, (amx[1] - amn[1]) * 0.55, 0], uBody: horseUniforms(vis, proc.L) };
+  },
+};
+
+class ArtistRig {
+  constructor(am) {
+    this.am = am; this.def = am.def; this.pos = [0, 0, 0]; this.yaw = 0; this.scale = 1; this.model = m4.id(); this.bones = new Float32Array(NUM_BONES * 12);
+    this.pose = this.def.rest.map(r => ({ t: r.t.slice(), r: r.r.slice(), s: r.s.slice() })); this.G = this.def.nodes.map(() => new Float32Array(16));
+    this.layers = []; this.restInv = this.def.joints.map(n => m4inv(this.def.restG[n]));
+    this.speedMul = 1; this.t = 0;
+    const u = Object.assign({}, am.uBody, { uBlink: 0, uEyeR: am.proc.L.eyeR || 0.03, uArt0: [1, 0.55, 0.42, 0] });
+    const mane = (am.proc.vis && am.proc.vis.mane) || {};
+    this.uBody = u; this.uHair = Object.assign({}, u, { uArt0: [0.6, 1, 0.42, 0], uMane: mane.c1 || u.uMane });   // the mane and tail take the genetic mane colour (flaxen, black, silver...)
+    this.uEye = { uColor: [0.012, 0.01, 0.009], uRough: 0.05, uMetal: 0, uEmitI: 0, uEmit: [0, 0, 0], uAlpha: 0 };
+    this.play('idle');
+  }
+  play(name, o = {}) {
+    const c = this.def.clips[name]; if (!c) return;
+    if (this.layers.length && this.layers[this.layers.length - 1].name === name) return;
+    for (const l of this.layers) l.fadeOut = o.fade ?? 0.25;
+    this.layers.push({ name, c, t: o.phase != null ? o.phase * c.dur : 0, w: this.layers.length ? 0 : 1, fadeIn: o.fade ?? 0.25, loop: o.loop !== false, speed: o.speed || 1 });
+  }
+  sample(l, i, path) {   // a node's channel from a layer at its current time
+    const c = l.c, f = (l.t / c.dur) * (c.frames - 1), a = Math.floor(f), b = Math.min(a + 1, c.frames - 1), u = f - a;
+    for (const tr of c._byNode ? c._byNode[i] || [] : []) if (tr.path === path) {
+      if (tr.c) return tr.c;
+      const n = path === 'r' ? 4 : 3, v = tr.v, k = path === 'r' ? 1 / 32767 : 1, o = [];
+      for (let j = 0; j < n; j++) o.push((v[a * n + j] + (v[b * n + j] - v[a * n + j]) * u) * k);
+      if (path === 'r') { const l2 = Math.hypot(...o) || 1; for (let j = 0; j < 4; j++) o[j] /= l2; }
+      return o;
+    }
+    return null;
+  }
+  update(dt) {
+    this.t += dt;
+    for (const l of this.layers) {
+      if (!l.c._byNode) { l.c._byNode = {}; for (const tr of l.c.tracks) (l.c._byNode[tr.node] = l.c._byNode[tr.node] || []).push(tr); }
+      l.t += dt * l.speed * this.speedMul; if (l.loop) l.t %= l.c.dur; else l.t = Math.min(l.t, l.c.dur - 1e-3);
+      if (l.fadeOut != null) l.w = Math.max(0, l.w - dt / Math.max(0.01, l.fadeOut)); else l.w = Math.min(1, l.w + dt / Math.max(0.01, l.fadeIn));
+    }
+    this.layers = this.layers.filter(l => l.w > 0 || l.fadeOut == null);
+    const rest = this.def.rest;
+    for (let i = 0; i < this.pose.length; i++) {
+      const P = this.pose[i], R = rest[i]; let wt = 0; const t = [0, 0, 0], s = [0, 0, 0], r = [0, 0, 0, 0];
+      for (const l of this.layers) {
+        if (l.w <= 0) continue;
+        const lt = this.sample(l, i, 't') || R.t, lr = this.sample(l, i, 'r') || R.r, ls = this.sample(l, i, 's') || R.s;
+        const d = r[0] * lr[0] + r[1] * lr[1] + r[2] * lr[2] + r[3] * lr[3], sg = wt > 0 && d < 0 ? -1 : 1;
+        for (let k = 0; k < 3; k++) { t[k] += lt[k] * l.w; s[k] += ls[k] * l.w; } for (let k = 0; k < 4; k++) r[k] += lr[k] * l.w * sg; wt += l.w;
+      }
+      if (wt <= 0) { P.t = R.t; P.r = R.r; P.s = R.s; continue; }
+      const rl = Math.hypot(...r) || 1; P.t = t.map(v => v / wt); P.s = s.map(v => v / wt); P.r = r.map(v => v / rl);
+    }
+    artGlobals(this.def, this.pose, this.G);
+    const A = this.am.A, Ai = this.am.Ai, T = ArtistRig._t || (ArtistRig._t = new Float32Array(16)), bb = this.bones;
+    this.def.joints.forEach((n, k) => {
+      m4.mul(this.G[n], this.restInv[k], T); m4.mul(A, T, T); m4.mul(T, Ai, T); const o = k * 12;
+      bb[o] = T[0]; bb[o + 1] = T[4]; bb[o + 2] = T[8]; bb[o + 3] = T[12]; bb[o + 4] = T[1]; bb[o + 5] = T[5]; bb[o + 6] = T[9]; bb[o + 7] = T[13]; bb[o + 8] = T[2]; bb[o + 9] = T[6]; bb[o + 10] = T[10]; bb[o + 11] = T[14];
+    });
+    this.model.set(m4.fromTRS(this.pos, quat.axisAngle([0, 1, 0], this.yaw), [this.scale, this.scale, this.scale]));
+  }
+  items() {
+    if (this._items) return this._items;
+    return this._items = this.am.meshes.map(m => {
+      if (m.eyePart) return { mesh: m.mesh, shader: 'std', defines: { SKIN: 1 }, model: this.model, bones: this.bones, uniforms: this.uEye, castShadow: false, cull: true };
+      const u = Object.assign({}, m.hairPart ? this.uHair : this.uBody, { uArtAlb: m.part.base, uArtNrm: m.part.normal || E.whiteTex });
+      u.uArt0 = [m.hairPart ? 0.35 : 1, m.hairPart ? 0.9 : 0.5, (m.part.base && m.part.base._lum) || 0.4, 0];
+      return { mesh: m.mesh, shader: 'horse', defines: { SKIN: 1, ARTMAP: 1 }, model: this.model, bones: this.bones, uniforms: u, castShadow: true, cull: !m.hairPart, a2c: m.hairPart };
+    });
+  }
+  setArtOnly(on) { for (const it of this.items()) if (it.uniforms.uArt0) it.uniforms.uArt0 = [it.uniforms.uArt0[0], it.uniforms.uArt0[1], it.uniforms.uArt0[2], on ? 1 : 0]; }
+}
+
+// ---------------- side-by-side test: the artist horse next to the code-built one ----------------
+const ArtistTest = {
+  list: [], last: 0,
+  async spawn(breed = 'Thoroughbred', seed = 3, where = 'studio', anim = 'idle', o = {}) {
+    const g = randomGenome(BREEDS[breed] ? breed : 'Thoroughbred', RNG(seed)), vis = express(g).vis;
+    const am = await ArtistModel.build('horse', vis), r = new ArtistRig(am);
+    const view = where === 'ranch' ? App.ranch : App.studio;
+    if (where === 'studio' && !o.noStudio) await App.showStudio([{ genome: g }]);
+    r.pos = o.pos || (where === 'studio' ? [0, 0, -2.3] : [App.ranch.oc.target[0], 0, App.ranch.oc.target[2]]); if (o.yaw != null) r.yaw = o.yaw;
+    r.play(anim, { fade: 0 }); r.update(0); view.S.items.push(...r.items()); this.list.push({ r, view, g });
+    return r;
+  },
+  clear() { for (const x of this.list) { const its = x.r.items(); x.view.S.items = x.view.S.items.filter(i => !its.includes(i)); } this.list = []; },
+  tick() { if (this.manual) return; const now = performance.now(), dt = Math.min(0.1, (now - (this.last || now)) / 1000); this.last = now; for (const x of this.list) x.r.update(dt); },
+};
+const _frameArt = App.frame;
+App.frame = function (now) { try { ArtistTest.tick(); } catch (e) { console.warn('artist', e); ArtistTest.list = []; } return _frameArt.call(this, now); };
+DevConsole.cmds.artist = function (a) {
+  if (a[0] === 'clear') { ArtistTest.clear(); return 'cleared'; }
+  if (a[0] === 'anim') { for (const x of ArtistTest.list) x.r.play(a[1] || 'idle'); return 'playing ' + (a[1] || 'idle') + ' · clips: ' + Object.keys((ArtistTest.list[0] || { r: { def: { clips: {} } } }).r.def.clips).join(' '); }
+  if (a[0] === 'own') { for (const x of ArtistTest.list) x.r.setArtOnly(a[1] !== 'off'); return 'artist colours ' + (a[1] !== 'off' ? 'on' : 'off'); }
+  const breed = a.slice(0, -1).join(' ') || 'Thoroughbred', seed = parseInt(a[a.length - 1]) || 3;
+  ArtistTest.spawn(isNaN(parseInt(a[a.length - 1])) ? (a.join(' ') || 'Thoroughbred') : breed, seed).then(() => DevConsole.print && DevConsole.print('artist horse ready')).catch(e => console.error(e));
+  return 'building the artist horse…';
+};
+
+/* ============================================================
+   ARTIST HORSES IN THE GAME — every plain horse (no wings, horns,
+   glows or other mythic parts) is drawn with the artist model:
+   the code-built rig still runs the animal (where it walks, how
+   fast, when it grazes, rears, lies down or jumps a fence) and the
+   artist model plays the matching animation over it, at the speed
+   it is really moving. Jockeys ride the artist horse's back.
+   Settings → Graphics → New horse models (a preview: off until switched on).
+   ============================================================ */
+const ArtHorses = {
+  on() { const s = Game.s && Game.s.settings; return !!(s && s.artHorses === true); },   // a preview for now: switched on in Settings
+  eligible(vis) {
+    if (!vis || vis.kit || (vis.wings && vis.wings.type) || (vis.horns && vis.horns.length) || (vis.finish && vis.finish.type) || vis.ghost || vis.glow || vis.aura || (vis.mane && vis.mane.mode) || (vis.tail && vis.tail.type) || vis.cover || vis.multiHead || (vis.proc && (vis.proc.orb || vis.proc.eye && vis.proc.eye.extra))) return false;
+    if (vis.species && vis.species.main && vis.species.main !== 'Horse') return false;
+    if (vis.arcana || vis.tack) return false;
+    return true;
+  },
+};
+// the code-built model is still made (its genetics, layout and body coordinates feed the artist model); the artist mesh rides along
+const _hmCreateAH = HorseModel.create;
+HorseModel.create = async function (E, vis, o = {}) {
+  if (o.noArtist || !ArtHorses.on() || !ArtHorses.eligible(vis)) return _hmCreateAH.call(this, E, vis);
+  const m = await _hmCreateAH.call(this, E, Object.assign({}, vis, { keepGeo: true }));
+  try { m.art = await ArtistModel.fromProc('horse', m, vis); } catch (e) { console.warn('artist horse', e); m.art = null; }
+  m.geo = null; return m;
+};
+// clip choice: what the code-built rig is doing, played by the artist model
+const AH_ACT = { munch: 'eat', graze: 'eat', browse: 'eat', sniff: 'eat', lie: 'sleep', sleep: 'sleep', rear: 'rear', buck: 'buck', toss: 'idle2', shake: 'idle2', nod: 'idle2', happy: 'idle2', paw: 'idle3', stomp: 'idle3', look: 'idle3', stretch: 'idle3', swish: 'idle', scratch: 'idle3', nuzzle: 'eat' };
+const _hrUpdateAH = HorseRig.prototype.update;
+HorseRig.prototype.update = function (dt) {
+  _hrUpdateAH.call(this, dt);
+  if (!this.m.art) return;
+  if (!this.art) this.art = new ArtistRig(this.m.art);
+  const A = this.art; A.pos = this.pos; A.yaw = this.yaw; A.scale = this.scale;
+  const sp = this.speed / Math.max(0.3, this.scale), ac = this.act;
+  let clip = 'idle', rate = 1;
+  if (this.air > 0.05) { clip = 'jumpRun'; }
+  else if (this.swim || this.inWater) { clip = Math.abs(this.yawRate) > 0.6 ? (this.yawRate > 0 ? 'swimL' : 'swimR') : 'swim'; rate = clamp(sp / 2.5, 0.6, 1.5); }
+  // the clips' own ground speeds (measured from the hooves on the ground): walk about 0.95 m/s, gallop about 4.6 m/s at full size;
+  // played faster to keep up, up to a real racehorse's two and a half strides a second
+  else if (sp > 2.3) { clip = Math.abs(this.yawRate) > 0.7 ? (this.yawRate > 0 ? 'gallopL' : 'gallopR') : 'gallop'; rate = clamp(sp / 4.6, 0.55, 2.45); }
+  else if (sp > 0.2) { clip = Math.abs(this.yawRate) > 0.6 ? (this.yawRate > 0 ? 'walkL' : 'walkR') : 'walk'; rate = clamp(sp / 0.95, 0.5, 2.2); }
+  else if (ac && AH_ACT[ac.type]) clip = AH_ACT[ac.type];
+  else if (this.graze > 0.5) clip = 'eat';
+  else if (this.rear > 0.3) clip = 'rear';
+  if (clip === 'sleep' && ac && ac.t > ac.dur - 1.6) clip = 'arise';
+  if (!A.def.clips[clip]) clip = 'idle';
+  const top = A.layers[A.layers.length - 1];
+  if (!top || top.name !== clip) A.play(clip, { fade: clip === 'jumpRun' ? 0.12 : 0.3, loop: !['arise', 'rear', 'buck', 'jumpRun'].includes(clip), phase: clip === 'jumpRun' ? 0.15 : undefined });
+  const L = A.layers[A.layers.length - 1]; if (L) L.speed = rate;
+  if (clip === 'jumpRun' && L) { const a = clamp(this.air, 0, 1), up = a >= (this._airPrev ?? 0); L.t = (up ? 0.14 + 0.36 * a : 0.5 + 0.36 * (1 - a)) * L.c.dur; L.speed = 0; }   // (the leap stays in step with the fence: take-off, over, landing)
+  this._airPrev = this.air;
+  A.update(dt);
+  if (this.jockey) this._jockeyOnArt();
+};
+HorseRig.prototype._jockeyOnArt = function () {   // the rider follows the artist horse's back instead of the code-built one
+  const A = this.art; if (!this._jb) { this._jb = new Float32Array(this.bones.length); const n = A.def.joints.map(j => A.def.nodes[j].name); this._artSpine = Math.max(0, n.findIndex(x => /spine_01|spine1|spine_1/i.test(x))); }
+  const jb = this._jb; jb.set(this.bones);
+  const rd = (b, o) => { const M = new Float32Array(16); M[0] = b[o]; M[4] = b[o + 1]; M[8] = b[o + 2]; M[12] = b[o + 3]; M[1] = b[o + 4]; M[5] = b[o + 5]; M[9] = b[o + 6]; M[13] = b[o + 7]; M[2] = b[o + 8]; M[6] = b[o + 9]; M[10] = b[o + 10]; M[14] = b[o + 11]; M[15] = 1; return M; };
+  const Ba = rd(A.bones, this._artSpine * 12), Bp = rd(this.bones, B.chest * 12), D = m4.mul(Ba, m4inv(Bp));
+  for (const j of [B.jRoot, B.jTorso, B.jArmL, B.jArmR]) { const M = m4.mul(D, rd(this.bones, j * 12)), o = j * 12;
+    jb[o] = M[0]; jb[o + 1] = M[4]; jb[o + 2] = M[8]; jb[o + 3] = M[12]; jb[o + 4] = M[1]; jb[o + 5] = M[5]; jb[o + 6] = M[9]; jb[o + 7] = M[13]; jb[o + 8] = M[2]; jb[o + 9] = M[6]; jb[o + 10] = M[10]; jb[o + 11] = M[14]; }
+};
+const _hrItemsAH = HorseRig.prototype.items;
+HorseRig.prototype.items = function (E, opts) {
+  const its = _hrItemsAH.call(this, E, opts);
+  if (!this.m.art) return its;
+  if (!this.art) this.art = new ArtistRig(this.m.art);
+  if (!this._artItems) {
+    const keep = its.filter(it => it.mesh !== this.m.body && it.mesh !== this.m.hair);
+    for (const it of keep) if (it.mesh === HorseRig.jockeyMesh) { if (!this._jb) this._jockeyOnArt(); it.bones = this._jb; }
+    for (const it of this.art.items()) it.lodRig = undefined;
+    this._artItems = [...this.art.items(), ...keep];
+    // keep the condition look (mud, gloss, scars) in step with the code-built body
+    for (const it of this.art.items()) if (it.uniforms && it.uniforms.uArtAlb) Object.defineProperty(it.uniforms, 'uCare', { get: () => this.uBody.uCare, enumerable: true, configurable: true });
+  }
+  this._items = this._artItems; return this._artItems;
+};
+// settings: a switch for the new models
+const _settingsAH = UI.settings;
+UI.settings = function () {
+  _settingsAH.call(this);
+  try { const box = document.querySelector('#modal .mbox'); if (!box) return; const on = ArtHorses.on();
+    const row = document.createElement('div'); row.className = 'spread'; row.innerHTML = `<span>New horse models<div class="muted" style="font-size:11.5px">Artist-made horses with real animation</div></span><button class="btn sm" data-act="artHorses">${on ? 'On' : 'Off'}</button>`;
+    const q = [...box.querySelectorAll('.eyebrow')].find(e => /Graphics/.test(e.textContent)); (q && q.parentElement ? q.parentElement : box).appendChild(row);
+  } catch (e) { console.warn(e); }
+};
+const _uiActAH = UI.act;
+UI.act = function (k, el, ev) {
+  if (k === 'artHorses') { Game.s.settings.artHorses = !ArtHorses.on(); Game.save(); if (typeof HorseCache !== 'undefined' && HorseCache.models) { for (const k2 of [...HorseCache.models.keys()]) HorseCache.drop(k2); } App.ranch.rigs.forEach(e => { e.key = null; }); App.ranch.sync(); this.settings(); this.toast('Horse models ' + (ArtHorses.on() ? 'on' : 'off') + '. Animals reload as you see them.', ''); return; }
+  return _uiActAH.call(this, k, el, ev);
+};
+DevConsole.cmds.arthorses = function (a) { Game.s.settings.artHorses = a[0] !== 'off'; Game.save(); return 'artist horses ' + (ArtHorses.on() ? 'on' : 'off') + ' (reload the page to rebuild every horse)'; };
+// ---------------- credits: the artists whose models the game uses (CC Attribution asks for this) ----------------
+const ART_CREDITS = [
+  { what: 'Horse (model and animations)', who: 'henry_7', lic: 'CC BY 4.0', url: 'https://sketchfab.com/3d-models/horse-a6f860e43e364619bccb174a1ac7d0c9' },
+];
+const _settingsCR = UI.settings;
+UI.settings = function () {
+  _settingsCR.call(this);
+  try { const box = document.querySelector('#modal .mbox'); if (!box) return;
+    const card = document.createElement('div'); card.className = 'card'; card.style.cssText = 'display:flex;flex-direction:column;gap:6px';
+    card.innerHTML = `<div style="font-weight:700">Credits</div><div class="muted" style="font-size:12px">3D models by these artists, used under Creative Commons licences.</div>` +
+      ART_CREDITS.map(c => `<div style="font-size:12.5px">${esc(c.what)} by <a href="${c.url}" target="_blank" rel="noopener" style="color:var(--brass-2)">${esc(c.who)}</a> · <span class="muted">${esc(c.lic)}</span></div>`).join('');
+    const reset = box.querySelector('[data-act=askReset]'), at = reset ? reset.closest('.card') : null; if (at) box.insertBefore(card, at); else box.appendChild(card);
+  } catch (e) { console.warn('credits', e); }
+};
+// riding: you sit on the artist horse's back, not the code-built one's
+HorseRig.prototype.artChest = function () {
+  if (!this.art) return this.world[B.chest];
+  if (this._artSpine == null) { const n = this.art.def.joints.map(j => this.art.def.nodes[j].name); this._artSpine = Math.max(0, n.findIndex(x => /spine_01|spine1|spine_1/i.test(x))); }
+  const rd = (b, o) => { const M = new Float32Array(16); M[0] = b[o]; M[4] = b[o + 1]; M[8] = b[o + 2]; M[12] = b[o + 3]; M[1] = b[o + 4]; M[5] = b[o + 5]; M[9] = b[o + 6]; M[13] = b[o + 7]; M[2] = b[o + 8]; M[6] = b[o + 9]; M[10] = b[o + 10]; M[14] = b[o + 11]; M[15] = 1; return M; };
+  return m4.mul(m4.mul(rd(this.art.bones, this._artSpine * 12), m4inv(rd(this.bones, B.chest * 12))), this.world[B.chest]);
+};
+if (typeof Walk !== 'undefined' && Walk.placeRider) {
+  const _placeRiderAH = Walk.placeRider;
+  Walk.placeRider = function () {
+    const r = this.ride && this.ride.ent && this.ride.ent.rig; if (!r || !r.art) return _placeRiderAH.call(this);
+    const orig = r.world[B.chest]; r.world[B.chest] = r.artChest(); try { return _placeRiderAH.call(this); } finally { r.world[B.chest] = orig; }
+  };
+}
+
+/* ============================================================
+   RACE COURSE FIXES — fliers in a Sky Rings race steer for each
+   ring and fly through its middle (they used to hold their lanes,
+   so most passed outside the ring), and their bodies, not their
+   feet, go through the centre. (Fences: 24_racetypes.js takes off
+   half a leap early, so every runner's arc tops out over the fence.)
+   ============================================================ */
+const _rvUpdateRF = RaceView.prototype.update;
+RaceView.prototype.update = function (dt) {
+  _rvUpdateRF.call(this, dt);
+  if (this.kind !== 'sky' || !this.started) return;
+  const n = this.runners.length;
+  for (const r of this.runners) {
+    if (r.fin || !r._kit || !r._kit.flies) continue;
+    const ob = this.obs.find(o => o.s >= r.s - 2); if (!ob) continue;
+    const ang = (r.no - 1) / Math.max(1, n) * TAU + 0.6; r._ringOff = [Math.cos(ang) * 1.6, Math.sin(ang) * 1.2];   // each flier its own line through the ring, so they don't pile up
+    const ahead = ob.s - r.s, pull = clamp(1 - (ahead - 8) / 60, 0, 1), want = TRACK.W / 2 + r._ringOff[0];
+    r.lat += clamp(want - r.lat, -3.5 * dt, 3.5 * dt) * pull; r.dlat = r.lat;
+  }
+};
+const _placeRF = RaceView.prototype._place;
+RaceView.prototype._place = function (r) {
+  _placeRF.call(this, r);
+  if (this.kind !== 'sky' || !r._kit || !r._kit.flies || !r._ringOff) return;
+  const rig = r.rig, ob = this.obs.find(o => o.s >= r.s - 2) || this.obs[this.obs.length - 1], prev = this.obs.filter(o => o.s < r.s - 2).pop();
+  const half = (rig.m ? rig.m.height * 0.42 : 0.8) * (rig.scale || 1), cy = o => o.y + 1.2 + r._ringOff[1] - half;   // the ring's centre, less half the body: the body goes through the middle
+  const y0 = prev ? cy(prev) : 0.5, y1 = ob ? cy(ob) : 3, u = prev && ob && ob.s > prev.s ? clamp((r.s - prev.s) / (ob.s - prev.s), 0, 1) : clamp(r.s / 60, 0, 1);
+  const up = this.started ? smooth(0, 40, r.s) : 0, e = u < 0.5 ? 0 : (u - 0.5) * 2;   // hold the line through a ring, then glide to the next
+  rig.pos[1] = (u < 0.2 ? y0 : lerp(y0, y1, e * e * (3 - 2 * e))) * up + 0.12 * Math.sin(this.t * 2 + r.no) * up;
+};
 
 </script>
 <script>if('serviceWorker' in navigator && location.protocol === 'https:') addEventListener('load', () => navigator.serviceWorker.register('sw.js').then(r => r.addEventListener('updatefound', () => { const w = r.installing; if (w) w.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) { try { UI.toast('A new version has downloaded. Close and reopen the app to play it.', 'gold'); } catch (e) { } } }); })).catch(() => { }));</script></body></html>
