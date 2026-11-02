@@ -1,6 +1,6 @@
 // Mythbreed Derby offline support. Online, the game page always comes fresh from the network, so updates show at once;
 // with no signal it opens from the saved copy. Icons and fonts come from the cache.
-const CACHE = 'mbd-c48e664e43', FONTS = 'mbd-fonts';
+const CACHE = 'mbd-cc0bd816f2', FONTS = 'mbd-fonts';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(CORE)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE && k !== FONTS).map(k => caches.delete(k)))).then(() => self.clients.claim())); });

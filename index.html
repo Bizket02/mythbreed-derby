@@ -1044,7 +1044,7 @@ const store = {
    ENGINE — small WebGL2 renderer: programs, meshes, instancing,
    shadow map, HDR MSAA target, bloom, tonemapped composite
    ============================================================ */
-const ATTR = { aPos: 0, aNormal: 1, aUV: 2, aColor: 3, aSkinIndex: 4, aSkinWeight: 5, aReg: 6, aExtra: 7, iA: 8, iB: 9, iC: 10 };
+const ATTR = { aPos: 0, aNormal: 1, aUV: 2, aColor: 3, aSkinIndex: 4, aSkinWeight: 5, aReg: 6, aExtra: 7, iA: 8, iB: 9, iC: 10, aRestP: 11 };   // aRestP: where an artist model's vertex sits on the code-built body, for its coat patterns
 const MAX_BONES = 72;
 
 class Camera {
@@ -1706,6 +1706,9 @@ const VS_MAIN = `
 layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNormal; layout(location=2) in vec2 aUV; layout(location=3) in vec4 aColor;
 layout(location=4) in vec4 aSkinIndex; layout(location=5) in vec4 aSkinWeight; layout(location=6) in vec4 aReg; layout(location=7) in vec4 aExtra;
 layout(location=8) in vec4 iA; layout(location=9) in vec4 iB; layout(location=10) in vec4 iC;
+#ifdef ARTMAP
+layout(location=11) in vec3 aRestP;
+#endif
 uniform mat4 uVP, uModel; uniform float uTime;
 #ifdef SKIN
 uniform vec4 uBones[MAX_BONES*3];   // bone matrices packed as 3 rows (affine)
@@ -1732,6 +1735,9 @@ out vec3 vWorld; out vec3 vNormal; out vec2 vUV; out vec4 vColor; out vec3 vRest
 void main(){
   vec3 p = aPos; vec3 n = aNormal; vec3 tg = vec3(-1.0, -0.32, 0.0);
   vRest = aPos; vRestN = aNormal; vReg = aReg; vExtra = aExtra; vUV = aUV; vColor = aColor; vInst = vec4(0.0);
+#ifdef ARTMAP
+  vRest = aRestP;   // an artist model's coat patterns (blazes, socks, spots) are laid out as on the code-built body
+#endif
 #ifdef HAIR
   float t = aExtra.x; float fl = 1.0 - aExtra.z; float w = t*t*fl;
   float ph = uTime*(2.2 + uFlow.x*0.22) + aExtra.y*6.283 + aPos.x*2.5;
@@ -27971,6 +27977,7 @@ const xfN = (M, n) => { const v = [M[0] * n[0] + M[4] * n[1] + M[8] * n[2], M[1]
 // shader's body coordinates line up; every vertex then borrows the region, body coordinates and occlusion of the nearest
 // point on the code-built animal of the same genome. Bones: B = A · G · Grest⁻¹ · A⁻¹.
 const ArtistModel = {
+  faceV2: false,   // (see fromProc)
   async build(name, vis, opts = {}) {
     const proc = await HorseModel.create(E, Object.assign({}, vis, { keepGeo: true }), { noArtist: true });
     const am = await this.fromProc(name, proc, vis, opts);
@@ -27979,6 +27986,7 @@ const ArtistModel = {
   },
   async fromProc(name, proc, vis, opts = {}) {
     const def = await MBM.load(name);
+    const faceV2 = opts.faceV2 ?? ArtistModel.faceV2;   // work in progress (step 3): coat patterns and face coordinates laid out exactly as on the code-built head; off until it matches everywhere
     const G0 = def.restG, J = def.joints;
     const skin0 = J.map((n, k) => m4.mul(G0[n], def.ibm.subarray(k * 16, k * 16 + 16), new Float32Array(16)));
     // rest-pose world positions of every part
@@ -28029,10 +28037,12 @@ const ArtistModel = {
       return best < 0 ? 0 : best;
     };
     // what each bone is, by its name: head, leg, hoof
-    const jn = J.map(n => def.nodes[n].name);
-    const isHeadJ = jn.map(n => /head|eye|ear|jaw|lip|nose|mouth|tongue|teeth|horn/i.test(n));
-    const isLegJ = jn.map(n => /arm|forearm|hand|finger|toe|thigh|thing|calf|shin|knee|link|foot|leg|hoof|ankle|wrist|cannon|pastern/i.test(n) && !/clavicle|shoulder|pelvis|hip\b/i.test(n));
-    const isToeJ = jn.map(n => /toe|hoof|finger|digit/i.test(n));
+    // bone names are matched by whole words ('BN_l_Forearm' and 'LeftForeArm' are legs, never an 'ear')
+    const words = n => n.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+    const jw = J.map(n => words(def.nodes[n].name)), hasW = (w, re) => w.some(t => re.test(t));
+    const isHeadJ = jw.map(w => hasW(w, /^(head|skull|eyes?|eyelids?|ears?|jaw|lips?|nose|nostrils?|mouth|tongue|teeth|tooth|horns?|muzzle|brow)$/));
+    const isLegJ = jw.map(w => hasW(w, /^(arm|upperarm|forearm|fore|hand|fingers?|toes?|thigh|thing|calf|shin|knee|link|horselink|foot|feet|leg|upleg|hoof|ankle|wrist|cannon|pastern|fetlock|hock)$/) && !hasW(w, /^(clavicle|shoulder|pelvis|hips?)$/));
+    const isToeJ = jw.map(w => hasW(w, /^(toes?|hoof|hooves|fingers?|digits?)$/));
     const hoofH = 0.075 * pB.top / 1.0;
     // the head is matched in its own frame (it may be carried higher or lower than the code-built one's), so faces keep their blazes, stars and snips
     const nodeAt = re => def.nodes.findIndex(n => re.test(n.name));
@@ -28043,6 +28053,27 @@ const ArtistModel = {
       const La = Math.hypot(nose[0] - Ha[0], nose[1] - Ha[1]), tip = proc.L.hx(1, 0, 0), poll = proc.L.poll, Lp = Math.hypot(tip[0] - poll[0], tip[1] - poll[1]);
       const d = Math.atan2(tip[1] - poll[1], tip[0] - poll[0]) - Math.atan2(nose[1] - Ha[1], nose[0] - Ha[0]), cd = Math.cos(d), sd = Math.sin(d), k = Lp / Math.max(La, 1e-4);
       headMap = q => { const x = q[0] - Ha[0], y = q[1] - Ha[1]; return [poll[0] + (x * cd - y * sd) * k, poll[1] + (x * sd + y * cd) * k, q[2] * k]; };
+      // better: pin three landmarks exactly (the eye, the base of the ear, the tip of the muzzle) with a side-on affine map, and the width by the eyes
+      if (faceV2) try {
+        const L = proc.L, eyeP = L.eyeC, earP = L.earBase && L.earBase(1);
+        const eyePart = parts.find(q => /cornea|eye/i.test(q.p.name));
+        const earJ = J.map((n, k) => hasW(jw[k], /^ears?$/) ? xf(A, xf(G0[n], [0, 0, 0])) : null).filter(Boolean).filter(p => p[2] > 0);
+        let tipA = null, tipP = null;
+        for (let i = 0; i < body.nv; i++) { let wh = 0; for (let k = 0; k < 4; k++) if (isHeadJ[body.p.j[i * 4 + k]]) wh += body.p.w[i * 4 + k] / 255; if (wh < 0.6) continue; const q = xf(A, [body.w[i * 3], body.w[i * 3 + 1], body.w[i * 3 + 2]]); if (Math.abs(q[2]) < 0.03 && (!tipA || q[0] > tipA[0])) tipA = q; }
+        for (let i = 0; i < gv; i++) { if (g.ext[i * 4] < 0.5 || g.reg[i * 4] > 3.5 || Math.abs(gp[i * 3 + 2]) > 0.03) continue; if (!tipP || gp[i * 3] > tipP[0]) tipP = [gp[i * 3], gp[i * 3 + 1], gp[i * 3 + 2]]; }
+        if (eyeP && earP && eyePart && earJ.length && tipA && tipP) {
+          let ea = [0, 0, 0], ne = 0; for (let i = 0; i < eyePart.nv; i++) { const q = xf(A, [eyePart.w[i * 3], eyePart.w[i * 3 + 1], eyePart.w[i * 3 + 2]]); if (q[2] > 0) { ea[0] += q[0]; ea[1] += q[1]; ea[2] += q[2]; ne++; } }
+          ea = ea.map(v => v / Math.max(1, ne));
+          const earA = earJ.reduce((b, p) => (!b || Math.hypot(p[0] - ea[0], p[1] - ea[1]) < Math.hypot(b[0] - ea[0], b[1] - ea[1]) ? p : b), null);   // the ear joint nearest the eye: its base
+          // solve [a b; c d] * (p - ea) = (P - eyeP) for the ear and the tip
+          const u1 = [earA[0] - ea[0], earA[1] - ea[1]], u2 = [tipA[0] - ea[0], tipA[1] - ea[1]], v1 = [earP[0] - eyeP[0], earP[1] - eyeP[1]], v2 = [tipP[0] - eyeP[0], tipP[1] - eyeP[1]];
+          const det = u1[0] * u2[1] - u2[0] * u1[1];
+          if (Math.abs(det) > 1e-6 && ne > 0) {
+            const a = (v1[0] * u2[1] - v2[0] * u1[1]) / det, b = (v2[0] * u1[0] - v1[0] * u2[0]) / det, c = (v1[1] * u2[1] - v2[1] * u1[1]) / det, dd = (v2[1] * u1[0] - v1[1] * u2[0]) / det, zk = eyeP[2] / Math.max(ea[2], 1e-4);
+            if (a > 0.3 && a < 3 && dd > 0.3 && dd < 3 && zk > 0.3 && zk < 3) headMap = q => { const x = q[0] - ea[0], y = q[1] - ea[1]; return [eyeP[0] + a * x + b * y, eyeP[1] + c * x + dd * y, q[2] * zk]; };
+          }
+        }
+      } catch (e) { console.warn('artist head landmarks', e); }
     }
     const hgrid = new Map();
     for (let i = 0; i < gv; i++) { if (g.ext[i * 4] < 0.5 || (g.reg[i * 4] > 3.5 && g.reg[i * 4] !== 9)) continue; const kk = key(Math.floor(gp[i * 3] / cell), Math.floor(gp[i * 3 + 1] / cell), Math.floor(gp[i * 3 + 2] / cell)); let b = hgrid.get(kk); if (!b) hgrid.set(kk, b = []); b.push(i); }
@@ -28051,22 +28082,31 @@ const ArtistModel = {
         for (const v of b) { const dd = (gp[v * 3] - x) ** 2 + (gp[v * 3 + 1] - y) ** 2 + (gp[v * 3 + 2] - z) ** 2; if (dd < bd) { bd = dd; best = v; } } }
       return best; };
     const meshes = parts.map(({ p, nv, w, nn }) => {
-      const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), reg = new Float32Array(nv * 4), ext = new Float32Array(nv * 4), uv = new Float32Array(nv * 2), col = new Float32Array(nv * 4);
+      const pos = new Float32Array(nv * 3), nrm = new Float32Array(nv * 3), reg = new Float32Array(nv * 4), ext = new Float32Array(nv * 4), uv = new Float32Array(nv * 2), col = new Float32Array(nv * 4), rp = new Float32Array(nv * 3);
       const hairPart = p.alpha || /hair|mane|tail/i.test(p.name), eyePart = /cornea|eye/i.test(p.name);
       for (let i = 0; i < nv; i++) {
+        let headReg = null;
         const q = xf(A, [w[i * 3], w[i * 3 + 1], w[i * 3 + 2]]); pos.set(q, i * 3); nrm.set(xfN(A, [nn[i * 3], nn[i * 3 + 1], nn[i * 3 + 2]]), i * 3);
         let wh0 = 0; for (let k = 0; k < 4; k++) if (isHeadJ[p.j[i * 4 + k]]) wh0 += p.w[i * 4 + k] / 255;
-        let v = -1; if (headMap && wh0 > 0.35) { const hq = headMap(q); v = nearestIn(hgrid, hq[0], hq[1], hq[2]); }
+        const hq = headMap && wh0 > 0.1 ? headMap(q) : null; let v = -1; if (hq && wh0 > 0.35) v = nearestIn(hgrid, hq[0], hq[1], hq[2]); const vHead = v;
         if (v < 0) v = nearest(q);
+        // the coat's patterns are worked out from where this point sits on the code-built body: the head in the head's own frame, the rest stretched to the same extents, blended across the throat
+        if (!faceV2) rp.set(q, i * 3); else { const cx = (pb.mn[0] + pb.mx[0]) / 2, b = [(q[0] - cx) * stretch[0] + cx, q[1], q[2] * stretch[2]], t = hq ? clamp((wh0 - 0.2) / 0.4, 0, 1) : 0;
+          rp.set(t > 0 ? [b[0] + (hq[0] - b[0]) * t, b[1] + (hq[1] - b[1]) * t, b[2] + (hq[2] - b[2]) * t] : b, i * 3); }
+        const HH = faceV2 && proc.spec && proc.spec.head;   // the face's own coordinates (where blazes, stars and snips sit) worked out exactly as the code-built mesher does, from that position
+        if (HH) { const rx = rp[i * 3] - HH.poll[0], ry = rp[i * 3 + 1] - HH.poll[1], rz = rp[i * 3 + 2] - HH.poll[2];
+          const along = rx * HH.axis[0] + ry * HH.axis[1] + rz * HH.axis[2], fr = rx * HH.front[0] + ry * HH.front[1] + rz * HH.front[2], lat = HH.lat ? rx * HH.lat[0] + ry * HH.lat[1] + rz * HH.lat[2] : rz;
+          let hu = along / HH.len; if (HH.mz && hu > 0.25) hu = 0.25 + (hu - 0.25) / HH.mz; headReg = [fr, lat, hu]; } else headReg = null;
         for (let k = 0; k < 4; k++) { reg[i * 4 + k] = g.reg[v * 4 + k]; ext[i * 4 + k] = g.ext[v * 4 + k]; }
+        if (headReg) { reg[i * 4 + 1] = headReg[0]; reg[i * 4 + 2] = headReg[1]; reg[i * 4 + 3] = headReg[2]; }
         if (reg[i * 4] > 3.5 && reg[i * 4] !== 9) reg[i * 4] = 0;
         let wh = 0, wl = 0, wt = 0;   // head, leg and hoof come from the artist's own skeleton, not the nearest point
         for (let k = 0; k < 4; k++) { const jj = p.j[i * 4 + k], ww = p.w[i * 4 + k] / 255; if (isHeadJ[jj]) wh += ww; if (isLegJ[jj]) wl += ww; if (isToeJ[jj]) wt += ww; }
-        ext[i * 4] = Math.min(1, wh); ext[i * 4 + 1] = Math.min(1, wl); ext[i * 4 + 2] = Math.min(1, wt) * clamp((hoofH + 0.02 - q[1]) / 0.04, 0, 1);
+        ext[i * 4] = Math.min(1, Math.max(wh, faceV2 && hq && wh0 > 0.35 && v === vHead ? g.ext[v * 4] : 0));   // a point matched onto the code-built head is head through and through (the artist's cheek and throat bones share weight with the neck) ext[i * 4 + 1] = Math.min(1, wl); ext[i * 4 + 2] = Math.min(1, wt) * clamp((hoofH + 0.02 - q[1]) / 0.04, 0, 1);
         uv[i * 2] = g.uv[v * 2]; uv[i * 2 + 1] = g.uv[v * 2 + 1];
         col[i * 4] = 1; col[i * 4 + 1] = hairPart ? 2 : eyePart ? 3 : 0; col[i * 4 + 2] = p.uv[i * 2]; col[i * 4 + 3] = p.uv[i * 2 + 1];
       }
-      const mesh = E.createMesh({ attribs: { aPos: { data: pos, size: 3 }, aNormal: { data: nrm, size: 3 }, aUV: { data: uv, size: 2 }, aColor: { data: col, size: 4 }, aSkinIndex: { data: p.j, size: 4 }, aSkinWeight: { data: p.w, size: 4, normalized: true }, aReg: { data: reg, size: 4 }, aExtra: { data: ext, size: 4 } }, index: p.idx });
+      const mesh = E.createMesh({ attribs: { aPos: { data: pos, size: 3 }, aNormal: { data: nrm, size: 3 }, aUV: { data: uv, size: 2 }, aColor: { data: col, size: 4 }, aSkinIndex: { data: p.j, size: 4 }, aSkinWeight: { data: p.w, size: 4, normalized: true }, aReg: { data: reg, size: 4 }, aExtra: { data: ext, size: 4 }, aRestP: { data: rp, size: 3 } }, index: p.idx });
       let lum = 0.5;   // the texture's average brightness, so the painted detail lightens and darkens around the genetic colour instead of shifting it
       return { mesh, part: p, hairPart, eyePart, lum, bounds: null };
     });
@@ -28170,21 +28210,44 @@ DevConsole.cmds.artist = function (a) {
 };
 
 /* ============================================================
-   ARTIST HORSES IN THE GAME — every plain horse (no wings, horns,
-   glows or other mythic parts) is drawn with the artist model:
+   ARTIST HORSES IN THE GAME — a pure-bred horse whose every trait
+   the artist model can show (ArtHorses.why) is drawn with it:
    the code-built rig still runs the animal (where it walks, how
    fast, when it grazes, rears, lies down or jumps a fence) and the
    artist model plays the matching animation over it, at the speed
    it is really moving. Jockeys ride the artist horse's back.
-   Settings → Graphics → New horse models (a preview: off until switched on).
+   Settings → New horse models (on by default; can be switched off).
    ============================================================ */
 const ArtHorses = {
-  on() { const s = Game.s && Game.s.settings; return !!(s && s.artHorses === true); },   // a preview for now: switched on in Settings
-  eligible(vis) {
-    if (!vis || vis.kit || (vis.wings && vis.wings.type) || (vis.horns && vis.horns.length) || (vis.finish && vis.finish.type) || vis.ghost || vis.glow || vis.aura || (vis.mane && vis.mane.mode) || (vis.tail && vis.tail.type) || vis.cover || vis.multiHead || (vis.proc && (vis.proc.orb || vis.proc.eye && vis.proc.eye.extra))) return false;
-    if (vis.species && vis.species.main && vis.species.main !== 'Horse') return false;
-    if (vis.arcana || vis.tack) return false;
-    return true;
+  on() { const s = Game.s && Game.s.settings; return !(s && s.artHorses === false); },   // on unless switched off in Settings
+  eligible(vis) { return !ArtHorses.why(vis); },
+  // why a creature keeps the code-built body (null = the artist horse shows everything its genes give it).
+  // The artist horse can't yet grow parts, swap feet or reshape its build, so anything the genes add or
+  // change beyond what it can show keeps the code-built body: nothing a creature inherits is ever hidden.
+  why(vis) {
+    if (!vis) return 'none';
+    const p = vis.proc || {}, m = vis.m || {}, h = vis.head || {}, e = vis.ear || {}, pl = vis.plan || {};
+    const out = (x, lo, hi) => !(x === undefined || (x >= lo && x <= hi));
+    { const lin = vis.lineage || {}; let tot = 0; for (const k in lin) tot += lin[k]; if (!tot || (lin.Horse || 0) / tot < 0.999) return 'species'; }   // pure horse lineage only (zebras, donkeys and every cross keep their own build)
+    if (vis.kit || vis.tack) return 'gear';
+    if ((vis.wings && vis.wings.type) || p.wing) return 'wings';
+    if ((vis.horns && vis.horns.length) || (p.horns && p.horns.length)) return 'horns';
+    if ((vis.back && vis.back.length) || p.dors || p.grow) return 'back parts';
+    if (vis.neck && vis.neck.type) return 'neck parts';
+    if ((vis.face && vis.face.length) || (vis.faceFx && vis.faceFx.some(x => x))) return 'face extras';
+    if (vis.feet !== 'hoof' || vis.feetF || vis.hoofMat) return 'feet';
+    if (vis.loco || vis.legs6 || vis.multiHead || (vis.form && vis.form.heads)) return 'body plan';
+    if (vis.gait && vis.gait.name) return 'gait style';   // prancing, strutting... the artist clips can't show a style yet
+    if ((vis.finish && vis.finish.type) || vis.cover || vis.ghost || vis.glow || vis.aura || vis.arcana || p.orb || p.step) return 'finish or effect';
+    if ((vis.mane && vis.mane.mode) || (vis.tail && vis.tail.type) || (pl.maneAmt ?? 1) < 0.9 || (pl.tailless || 0) > 0.1 || (pl.earless || 0) > 0.1) return 'mane or tail';
+    if (vis.eyeType || vis.eyeGlow || (p.eye && (p.eye.extra || (p.eye.pup || 0) > 0.15 || (p.eye.scl || 0) > 0.2))) return 'eyes';
+    { const c = (vis.coat && vis.coat.eye) || [0, 0, 0], c2 = vis.eyeCol2 || c; if (Math.max(...c) > 0.12 || c[2] > c[0] || c2.some((x, i) => Math.abs(x - c[i]) > 0.01)) return 'eye colour'; }
+    if ((vis.fluff ?? 0.15) > 0.38 || (m.feather || 0) > 0.1) return 'fluffy coat or feathering';
+    // build: the artist horse is one body shape until gene-driven reshaping lands, so only builds close to it
+    if (out(m.legLen, 0.85, 1.15) || out(m.neckLen, 0.8, 1.25) || out(m.bodyLen, 0.88, 1.15) || out(m.depth, 0.88, 1.15) || out(m.width, 0.85, 1.18)) return 'build';
+    if (out(h.len, 0.8, 1.25) || out(h.wid, 0.8, 1.25) || out(h.snout, 0.8, 1.25) || out(h.jaw, 0.8, 1.25) || out(h.flat, 0.8, 1.25) || out(h.dome, 0.8, 1.25) || out(h.muz, 0.8, 1.25) || out(h.eye, 0.8, 1.3) || (h.brow || 0) > 0.45 || (h.dragon || 0) > 0.05 || (h.beak || 0) > 0.05 || (h.trunk || 0) > 0.05 || (h.tube || 0) > 0.05) return 'head shape';
+    if (out(e.len, 0.7, 1.4) || out(e.wid, 0.75, 1.4) || (e.droop || 0) > 0.15 || (e.curl || 0) > 0.15 || (e.tuft || 0) > 0.15 || (e.sweep || 0) > 0.15 || (e.round || 0) > 0.4 || (e.out || 0) > 0.35 || e.ant || e.fin || e.plume) return 'ears';
+    return null;
   },
 };
 // the code-built model is still made (its genetics, layout and body coordinates feed the artist model); the artist mesh rides along
@@ -28192,6 +28255,7 @@ const _hmCreateAH = HorseModel.create;
 HorseModel.create = async function (E, vis, o = {}) {
   if (o.noArtist || !ArtHorses.on() || !ArtHorses.eligible(vis)) return _hmCreateAH.call(this, E, vis);
   const m = await _hmCreateAH.call(this, E, Object.assign({}, vis, { keepGeo: true }));
+  if (m.L && (m.L.kit || m.L.legless || m.L.limb || m.L.biped || m.L.multiHead)) { m.geo = null; return m; }   // a second guard: any family build or changed body plan keeps the code-built body
   try { m.art = await ArtistModel.fromProc('horse', m, vis); } catch (e) { console.warn('artist horse', e); m.art = null; }
   m.geo = null; return m;
 };
